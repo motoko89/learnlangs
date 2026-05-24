@@ -23,15 +23,15 @@ I/O folders (created at invocation cwd):
   outputs/                - final concatenated study MP3
 
 Credentials (next to this script):
-  key.json       - {"key": "<Google API key>",
-                    "azDictKey": "<Azure Cognitive Services key>",
+  key.json       - {"azSpeechKey": "<Azure Cognitive Services key>",
                     "azSpeechRegion": "<e.g. eastus>",
                     "gcsBucket": "<GCS bucket for STT staging>"}
-  jumeau-gc.json - Google Cloud service account JSON
+  jumeau-gc.json - Google Cloud service account JSON (used for STT, Translate v3)
 
 Dependencies:
   pip install -r requirements.txt
   brew install ffmpeg   # pydub MP3 decode; also used by yt-dlp
+  python3 ytconverter.py
 """
 
 from __future__ import annotations
@@ -399,19 +399,24 @@ def transliterate(text: str, az_key: str) -> str:
     return ""
 
 
-def translate_batch(texts: list[str], translate_url: str, batch_size: int = 100) -> dict[str, str]:
+def translate_batch(texts: list[str], project_id: str, batch_size: int = 100) -> dict[str, str]:
+    """zh-TW → en via Cloud Translate v3 (service-account auth from GOOGLE_APPLICATION_CREDENTIALS)."""
+    from google.cloud import translate_v3
+
+    client = translate_v3.TranslationServiceClient()
+    parent = f"projects/{project_id}/locations/global"
     out: dict[str, str] = {}
     for i in range(0, len(texts), batch_size):
         chunk = texts[i : i + batch_size]
-        resp = requests.post(
-            translate_url,
-            json={"q": chunk, "target": "en", "source": "zh-TW", "format": "text"},
-            timeout=60,
+        resp = client.translate_text(
+            parent=parent,
+            contents=chunk,
+            mime_type="text/plain",
+            source_language_code="zh-TW",
+            target_language_code="en",
         )
-        resp.raise_for_status()
-        translations = resp.json().get("data", {}).get("translations", [])
-        for src, t in zip(chunk, translations):
-            out[src] = t.get("translatedText", "")
+        for src, t in zip(chunk, resp.translations):
+            out[src] = t.translated_text
     return out
 
 
@@ -582,14 +587,16 @@ def main():
     ensure_dirs(inputs_dir, intermediates_root, outputs_dir)
 
     keys = load_keys(Path(args.keys))
-    az_key = keys["azDictKey"]
+    az_key = keys.get("azSpeechKey") or keys.get("azDictKey")
+    if not az_key:
+        print("key.json must contain 'azSpeechKey' (or legacy 'azDictKey').", file=sys.stderr)
+        sys.exit(1)
     az_region = args.azure_region or keys.get("azSpeechRegion")
     if not az_region:
         az_region = input("Azure Speech region (e.g. eastus): ").strip()
     gcs_bucket = args.gcs_bucket or keys.get("gcsBucket")
     if not gcs_bucket:
         gcs_bucket = input("GCS bucket for STT staging: ").strip()
-    translate_url = "https://translation.googleapis.com/language/translate/v2?key=" + keys["key"]
 
     gc_path = Path(args.gc).resolve()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(gc_path)
@@ -674,7 +681,7 @@ def main():
     print("\n[5/7] enrich (translate words + sentences, pinyin)")
     words_list = list(new_words.keys())
     try:
-        word_meanings = translate_batch(words_list, translate_url)
+        word_meanings = translate_batch(words_list, project_id)
     except Exception as e:
         print(f"  (word translate failed: {e})", file=sys.stderr)
         word_meanings = {w: "" for w in words_list}
@@ -707,7 +714,7 @@ def main():
 
     nw_sentence_texts = [sentences[idx].text for idx in sentence_new_words]
     try:
-        sentence_translations_raw = translate_batch(nw_sentence_texts, translate_url, batch_size=50)
+        sentence_translations_raw = translate_batch(nw_sentence_texts, project_id, batch_size=50)
     except Exception as e:
         print(f"  (sentence translate failed: {e})", file=sys.stderr)
         sentence_translations_raw = {}
