@@ -216,44 +216,43 @@ def transcribe(files: list[tuple[str, int]], project_id: str) -> list[WordRec]:
             ),
         ),
     )
-    uri_offsets = dict(files)
-    request = cloud_speech.BatchRecognizeRequest(
-        recognizer=recognizer,
-        config=config,
-        files=[cloud_speech.BatchRecognizeFileMetadata(uri=uri) for uri, _ in files],
-        recognition_output_config=cloud_speech.RecognitionOutputConfig(
-            inline_response_config=cloud_speech.InlineOutputConfig(),
-        ),
-    )
-    print("  → STT v2 (chirp_3) BatchRecognize submitted; waiting (minutes)...")
-    operation = client.batch_recognize(request=request)
-    response = operation.result(timeout=3600)
-
     words: list[WordRec] = []
-    for uri, file_result in response.results.items():
-        offset = uri_offsets.get(uri, 0)
-        err = getattr(file_result, "error", None)
-        if err and getattr(err, "code", 0):
-            print(f"  ! file error for {uri}: code={err.code} message={err.message}", file=sys.stderr)
-            continue
-        results = list(file_result.transcript.results) if file_result.transcript else []
-        print(f"  · {uri} (+{offset}ms): {len(results)} transcript result(s)")
-        for ri, result in enumerate(results):
-            if not result.alternatives:
-                print(f"    [{ri}] no alternatives", file=sys.stderr)
+    for i, (uri, offset) in enumerate(files, 1):
+        request = cloud_speech.BatchRecognizeRequest(
+            recognizer=recognizer,
+            config=config,
+            files=[cloud_speech.BatchRecognizeFileMetadata(uri=uri)],
+            recognition_output_config=cloud_speech.RecognitionOutputConfig(
+                inline_response_config=cloud_speech.InlineOutputConfig(),
+            ),
+        )
+        print(f"  → [{i}/{len(files)}] STT v2 (chirp_3) BatchRecognize submitted (+{offset}ms); waiting...")
+        operation = client.batch_recognize(request=request)
+        response = operation.result(timeout=3600)
+
+        for resp_uri, file_result in response.results.items():
+            err = getattr(file_result, "error", None)
+            if err and getattr(err, "code", 0):
+                print(f"  ! file error for {resp_uri}: code={err.code} message={err.message}", file=sys.stderr)
                 continue
-            alt = result.alternatives[0]
-            if ri == 0:
-                preview = (alt.transcript or "")[:80].replace("\n", " ")
-                print(f"    [{ri}] words={len(alt.words)} transcript[:80]={preview!r}")
-            for wi in alt.words:
-                if not wi.word:
+            results = list(file_result.transcript.results) if file_result.transcript else []
+            print(f"  · {resp_uri}: {len(results)} transcript result(s)")
+            for ri, result in enumerate(results):
+                if not result.alternatives:
+                    print(f"    [{ri}] no alternatives", file=sys.stderr)
                     continue
-                words.append(WordRec(
-                    word=wi.word,
-                    start_ms=_duration_to_ms(wi.start_offset) + offset,
-                    end_ms=_duration_to_ms(wi.end_offset) + offset,
-                ))
+                alt = result.alternatives[0]
+                if ri == 0:
+                    preview = (alt.transcript or "")[:80].replace("\n", " ")
+                    print(f"    [{ri}] words={len(alt.words)} transcript[:80]={preview!r}")
+                for wi in alt.words:
+                    if not wi.word:
+                        continue
+                    words.append(WordRec(
+                        word=wi.word,
+                        start_ms=_duration_to_ms(wi.start_offset) + offset,
+                        end_ms=_duration_to_ms(wi.end_offset) + offset,
+                    ))
     words.sort(key=lambda w: w.start_ms)
     return words
 
