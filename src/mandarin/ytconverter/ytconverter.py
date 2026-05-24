@@ -194,7 +194,7 @@ def _duration_to_ms(d) -> int:
     return int(d.seconds * 1000 + d.nanos // 1_000_000)
 
 
-def transcribe(files: list[tuple[str, int]], project_id: str) -> list[WordRec]:
+def transcribe(files: list[tuple[str, int]], project_id: str, speaker_count: int) -> list[WordRec]:
     """Chirp v2 BatchRecognize across N files. files = [(gcs_uri, offset_ms), ...].
     Returns flat list of word records (Hans), timestamps already offset and sorted."""
     from google.api_core.client_options import ClientOptions
@@ -213,8 +213,8 @@ def transcribe(files: list[tuple[str, int]], project_id: str) -> list[WordRec]:
             enable_automatic_punctuation=True,
             enable_word_time_offsets=True,
             diarization_config=cloud_speech.SpeakerDiarizationConfig(
-                min_speaker_count=2,
-                max_speaker_count=2,
+                min_speaker_count=speaker_count,
+                max_speaker_count=speaker_count,
             ),
         ),
     )
@@ -661,6 +661,13 @@ def main():
         print(f"  cached: {transcript_json_path.name}")
         sentences = sentences_from_jsonable(cached_rows)
     else:
+        try:
+            speaker_count = int(input("How many speakers in the audio? ").strip() or "2")
+        except ValueError:
+            speaker_count = 2
+        if speaker_count < 1:
+            speaker_count = 1
+        print(f"  → diarization: {speaker_count} speaker(s)")
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             print(f"  → MP3 → FLAC chunks ({TARGET_SAMPLE_RATE}Hz mono, ≤{STT_CHUNK_MS // 60000}min each)")
@@ -674,7 +681,7 @@ def main():
                 gcs_uri, blob = upload_to_gcs(chunk_path, gcs_bucket, blob_name)
                 uploaded.append((gcs_uri, offset_ms, blob))
             try:
-                hans_words = transcribe([(u, o) for u, o, _ in uploaded], project_id)
+                hans_words = transcribe([(u, o) for u, o, _ in uploaded], project_id, speaker_count)
             finally:
                 for _, _, blob in uploaded:
                     try:
