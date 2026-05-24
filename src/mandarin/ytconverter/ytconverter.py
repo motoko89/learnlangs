@@ -603,7 +603,7 @@ def main():
     parser.add_argument("--gc", default=str(SCRIPT_DIR / "jumeau-gc.json"))
     parser.add_argument("--gcs-bucket", help="GCS bucket for STT staging (else read from key.json:gcsBucket)")
     parser.add_argument("--azure-region", help="Azure Speech region (else read from key.json:azSpeechRegion)")
-    parser.add_argument("--chunk-minutes", type=float, default=10.0)
+    parser.add_argument("--chunk-minutes", type=float, default=5.0)
     args = parser.parse_args()
 
     ensure_hsk_file(HSK_PATH)
