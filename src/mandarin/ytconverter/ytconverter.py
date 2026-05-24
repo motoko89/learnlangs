@@ -69,6 +69,8 @@ CHUNK_TARGET_MS = 5 * 60 * 1000
 STT_CHUNK_MS = 18 * 60 * 1000  # under chirp_3's 20-min BatchRecognize limit
 
 SENTENCE_END_CHARS = "。！？!?."
+SUB_SENTENCE_BREAK_CHARS = "，,、；;：:"
+MAX_SENTENCE_MS = 5000
 PROPER_NOUN_POS = {"nr", "ns", "nt", "nz", "nrfg", "nrt"}
 SKIP_POS = {"u", "uj", "ul", "ud", "uv", "uz", "ug", "p", "c", "y", "e", "o", "x", "w", "m"}
 PUNCT_OR_DIGIT_RE = re.compile(r"^[\W\d_]+$", re.UNICODE)
@@ -306,6 +308,35 @@ def build_sentences(words: list[WordRec]) -> list[Sentence]:
             words=buf,
         ))
     return sentences
+
+
+def _sentence_from_words(buf: list[WordRec]) -> Sentence:
+    return Sentence(
+        text="".join(x.word for x in buf).strip(),
+        start_ms=buf[0].start_ms,
+        end_ms=buf[-1].end_ms,
+        words=list(buf),
+    )
+
+
+def split_long_sentences(sentences: list[Sentence], max_ms: int) -> list[Sentence]:
+    """Split sentences longer than max_ms at secondary punctuation marks."""
+    out: list[Sentence] = []
+    for s in sentences:
+        if s.end_ms - s.start_ms <= max_ms:
+            out.append(s)
+            continue
+        pieces: list[Sentence] = []
+        buf: list[WordRec] = []
+        for w in s.words:
+            buf.append(w)
+            if w.word and w.word[-1] in SUB_SENTENCE_BREAK_CHARS:
+                pieces.append(_sentence_from_words(buf))
+                buf = []
+        if buf:
+            pieces.append(_sentence_from_words(buf))
+        out.extend(pieces if len(pieces) > 1 else [s])
+    return out
 
 
 def sentences_to_jsonable(sentences: list[Sentence]) -> list[dict]:
@@ -703,6 +734,11 @@ def main():
     if not sentences:
         print("Empty transcript; aborting.", file=sys.stderr)
         sys.exit(1)
+
+    before = len(sentences)
+    sentences = split_long_sentences(sentences, MAX_SENTENCE_MS)
+    if len(sentences) != before:
+        print(f"  → split long sentences: {before} → {len(sentences)} (>{MAX_SENTENCE_MS}ms broken on '{SUB_SENTENCE_BREAK_CHARS}')")
 
     transcript_text = "".join(s.text for s in sentences)
 
