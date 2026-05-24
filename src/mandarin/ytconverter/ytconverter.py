@@ -65,7 +65,7 @@ TTS_RATE = "0.9"
 INTRA_GROUP_BREAK_MS = 500
 INTER_PART_BREAK_MS = 1000
 INTER_CHUNK_BREAK_MS = 2000
-CHUNK_TARGET_MS = 10 * 60 * 1000
+CHUNK_TARGET_MS = 5 * 60 * 1000
 STT_CHUNK_MS = 18 * 60 * 1000  # under chirp_3's 20-min BatchRecognize limit
 
 SENTENCE_END_CHARS = "。！？!?."
@@ -214,7 +214,7 @@ def transcribe(files: list[tuple[str, int]], project_id: str) -> list[WordRec]:
             enable_word_time_offsets=True,
             diarization_config=cloud_speech.SpeakerDiarizationConfig(
                 min_speaker_count=2,
-                max_speaker_count=3,
+                max_speaker_count=2,
             ),
         ),
     )
@@ -411,17 +411,15 @@ def pick_round(
 
 # ─── Pinyin + translation ─────────────────────────────────────────────────────
 
-def transliterate(text: str, az_key: str) -> str:
+def transliterate(text: str, az_key: str, az_region: str | None = None) -> str:
     url = (
         "https://api.cognitive.microsofttranslator.com/transliterate"
         "?api-version=3.0&language=zh-Hant&fromScript=Hant&toScript=Latn"
     )
-    resp = requests.post(
-        url,
-        headers={"Ocp-Apim-Subscription-Key": az_key, "Content-Type": "application/json"},
-        json=[{"Text": text}],
-        timeout=30,
-    )
+    headers = {"Ocp-Apim-Subscription-Key": az_key, "Content-Type": "application/json"}
+    if az_region:
+        headers["Ocp-Apim-Subscription-Region"] = az_region
+    resp = requests.post(url, headers=headers, json=[{"Text": text}], timeout=30)
     resp.raise_for_status()
     result = resp.json()
     if result and "text" in result[0]:
@@ -512,10 +510,12 @@ def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> Audio
     return AudioSegment.from_mp3(str(out_path))
 
 
-def _voice(name: str, text: str) -> str:
+def _voice(name: str, text: str, lead_break_ms: int = 0, trail_break_ms: int = 0) -> str:
+    lead = f'<break time="{lead_break_ms}ms"/>' if lead_break_ms else ""
+    trail = f'<break time="{trail_break_ms}ms"/>' if trail_break_ms else ""
     return (
         f'<voice name="{name}">'
-        f'<prosody rate="{TTS_RATE}">{html.escape(text)}</prosody>'
+        f'<prosody rate="{TTS_RATE}">{lead}{html.escape(text)}{trail}</prosody>'
         f'</voice>'
     )
 
@@ -532,18 +532,16 @@ def ssml_words_and_meanings(pairs: list[tuple[str, str]]) -> str:
     """pairs = [(traditional_word, english_meaning), ...]"""
     parts: list[str] = []
     for i, (w, en) in enumerate(pairs):
-        if i:
-            parts.append(f'<break time="{INTRA_GROUP_BREAK_MS}ms"/>')
-        parts.append(_voice(TW_VOICE, w))
-        parts.append(f'<break time="{INTRA_GROUP_BREAK_MS}ms"/>')
+        # break before each pair after the first — placed inside the leading voice
+        lead = INTRA_GROUP_BREAK_MS if i else 0
+        parts.append(_voice(TW_VOICE, w, lead_break_ms=lead, trail_break_ms=INTRA_GROUP_BREAK_MS))
         parts.append(_voice(EN_VOICE, en or "(no translation)"))
     return _wrap_ssml("".join(parts))
 
 
 def ssml_sentence_pair(zh_text: str, en_text: str) -> str:
     body = (
-        _voice(TW_VOICE, zh_text)
-        + f'<break time="{INTRA_GROUP_BREAK_MS}ms"/>'
+        _voice(TW_VOICE, zh_text, trail_break_ms=INTRA_GROUP_BREAK_MS)
         + _voice(EN_VOICE, en_text or "(no translation)")
     )
     return _wrap_ssml(body)
@@ -734,7 +732,7 @@ def main():
     pinyin_map: dict[str, str] = {}
     for i, w in enumerate(words_list, 1):
         try:
-            pinyin_map[w] = transliterate(w, az_key)
+            pinyin_map[w] = transliterate(w, az_key, az_region)
         except Exception as e:
             print(f"    pinyin failed for {w!r}: {e}", file=sys.stderr)
             pinyin_map[w] = ""
