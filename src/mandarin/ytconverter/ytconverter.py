@@ -43,6 +43,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -678,6 +679,9 @@ def main():
     chunks_cache = inter_dir / "chunks"
     transcript_json_path = inter_dir / "transcript.json"
     vocab_tsv_path = inter_dir / "vocab.tsv"
+    for stale in (tts_cache, chunks_cache):
+        if stale.exists():
+            shutil.rmtree(stale)
     ensure_dirs(inter_dir, tts_cache, chunks_cache)
 
     # ── 2. Transcribe (cached) ──────────────────────────────────────────────
