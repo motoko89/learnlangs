@@ -66,6 +66,7 @@ INTRA_GROUP_BREAK_MS = 500
 INTER_PART_BREAK_MS = 1000
 INTER_CHUNK_BREAK_MS = 2000
 CHUNK_TARGET_MS = 10 * 60 * 1000
+STT_CHUNK_MS = 18 * 60 * 1000  # under chirp_3's 20-min BatchRecognize limit
 
 SENTENCE_END_CHARS = "。！？!?."
 PROPER_NOUN_POS = {"nr", "ns", "nt", "nz", "nrfg", "nrt"}
@@ -152,10 +153,20 @@ def download_youtube(url: str, inputs_dir: Path) -> Path:
 
 # ─── Audio convert + GCS upload (reused from prior version) ───────────────────
 
-def convert_mp3_to_flac(mp3_path: Path, out_path: Path) -> None:
+def split_mp3_to_flac_chunks(
+    mp3_path: Path, chunk_ms: int, out_dir: Path
+) -> list[tuple[Path, int]]:
+    """Decode MP3 once, split into ≤chunk_ms FLAC pieces. Returns [(path, offset_ms)]."""
     audio = AudioSegment.from_mp3(str(mp3_path))
     audio = audio.set_frame_rate(TARGET_SAMPLE_RATE).set_channels(TARGET_CHANNELS)
-    audio.export(str(out_path), format="flac")
+    total_ms = len(audio)
+    out: list[tuple[Path, int]] = []
+    for i, start in enumerate(range(0, total_ms, chunk_ms)):
+        end = min(start + chunk_ms, total_ms)
+        chunk_path = out_dir / f"chunk_{i:03d}.flac"
+        audio[start:end].export(str(chunk_path), format="flac")
+        out.append((chunk_path, start))
+    return out
 
 
 def upload_to_gcs(local_path: Path, bucket_name: str, blob_name: str):
@@ -181,8 +192,9 @@ def _duration_to_ms(d) -> int:
     return int(d.seconds * 1000 + d.nanos // 1_000_000)
 
 
-def transcribe(gcs_uri: str, project_id: str) -> list[WordRec]:
-    """Chirp v2 BatchRecognize. Returns flat ordered list of word records (Hans)."""
+def transcribe(files: list[tuple[str, int]], project_id: str) -> list[WordRec]:
+    """Chirp v2 BatchRecognize across N files. files = [(gcs_uri, offset_ms), ...].
+    Returns flat list of word records (Hans), timestamps already offset and sorted."""
     from google.api_core.client_options import ClientOptions
     from google.cloud.speech_v2 import SpeechClient
     from google.cloud.speech_v2.types import cloud_speech
@@ -204,10 +216,11 @@ def transcribe(gcs_uri: str, project_id: str) -> list[WordRec]:
             ),
         ),
     )
+    uri_offsets = dict(files)
     request = cloud_speech.BatchRecognizeRequest(
         recognizer=recognizer,
         config=config,
-        files=[cloud_speech.BatchRecognizeFileMetadata(uri=gcs_uri)],
+        files=[cloud_speech.BatchRecognizeFileMetadata(uri=uri) for uri, _ in files],
         recognition_output_config=cloud_speech.RecognitionOutputConfig(
             inline_response_config=cloud_speech.InlineOutputConfig(),
         ),
@@ -218,12 +231,13 @@ def transcribe(gcs_uri: str, project_id: str) -> list[WordRec]:
 
     words: list[WordRec] = []
     for uri, file_result in response.results.items():
+        offset = uri_offsets.get(uri, 0)
         err = getattr(file_result, "error", None)
         if err and getattr(err, "code", 0):
             print(f"  ! file error for {uri}: code={err.code} message={err.message}", file=sys.stderr)
             continue
         results = list(file_result.transcript.results) if file_result.transcript else []
-        print(f"  · {uri}: {len(results)} transcript result(s)")
+        print(f"  · {uri} (+{offset}ms): {len(results)} transcript result(s)")
         for ri, result in enumerate(results):
             if not result.alternatives:
                 print(f"    [{ri}] no alternatives", file=sys.stderr)
@@ -237,9 +251,10 @@ def transcribe(gcs_uri: str, project_id: str) -> list[WordRec]:
                     continue
                 words.append(WordRec(
                     word=wi.word,
-                    start_ms=_duration_to_ms(wi.start_offset),
-                    end_ms=_duration_to_ms(wi.end_offset),
+                    start_ms=_duration_to_ms(wi.start_offset) + offset,
+                    end_ms=_duration_to_ms(wi.end_offset) + offset,
                 ))
+    words.sort(key=lambda w: w.start_ms)
     return words
 
 
@@ -637,32 +652,47 @@ def main():
 
     # ── 2. Transcribe (cached) ──────────────────────────────────────────────
     print("\n[2/7] transcribe")
+    cached_rows: list[dict] = []
     if transcript_json_path.exists() and transcript_json_path.stat().st_size > 0:
+        try:
+            cached_rows = json.loads(transcript_json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            cached_rows = []
+    if cached_rows:
         print(f"  cached: {transcript_json_path.name}")
-        sentences = sentences_from_jsonable(json.loads(transcript_json_path.read_text(encoding="utf-8")))
+        sentences = sentences_from_jsonable(cached_rows)
     else:
         with tempfile.TemporaryDirectory() as td:
-            flac_path = Path(td) / (stem + ".flac")
-            print(f"  → MP3 → FLAC ({TARGET_SAMPLE_RATE}Hz mono)")
-            convert_mp3_to_flac(mp3_path, flac_path)
-            blob_name = f"stt-staging/{stem}-{int(time.time())}.flac"
-            print(f"  → upload to gs://{gcs_bucket}/{blob_name}")
-            gcs_uri, blob = upload_to_gcs(flac_path, gcs_bucket, blob_name)
+            td_path = Path(td)
+            print(f"  → MP3 → FLAC chunks ({TARGET_SAMPLE_RATE}Hz mono, ≤{STT_CHUNK_MS // 60000}min each)")
+            flac_chunks = split_mp3_to_flac_chunks(mp3_path, STT_CHUNK_MS, td_path)
+            print(f"  → {len(flac_chunks)} chunk(s)")
+            timestamp = int(time.time())
+            uploaded: list[tuple[str, int, object]] = []  # (uri, offset_ms, blob)
+            for chunk_path, offset_ms in flac_chunks:
+                blob_name = f"stt-staging/{stem}-{timestamp}-{chunk_path.stem}.flac"
+                print(f"  → upload to gs://{gcs_bucket}/{blob_name} (+{offset_ms}ms)")
+                gcs_uri, blob = upload_to_gcs(chunk_path, gcs_bucket, blob_name)
+                uploaded.append((gcs_uri, offset_ms, blob))
             try:
-                hans_words = transcribe(gcs_uri, project_id)
+                hans_words = transcribe([(u, o) for u, o, _ in uploaded], project_id)
             finally:
-                try:
-                    blob.delete()
-                except Exception as e:
-                    print(f"  (warning: failed to delete staged blob: {e})", file=sys.stderr)
+                for _, _, blob in uploaded:
+                    try:
+                        blob.delete()
+                    except Exception as e:
+                        print(f"  (warning: failed to delete staged blob: {e})", file=sys.stderr)
         print(f"  → {len(hans_words)} word records; OpenCC s2tw")
         tw_words = [WordRec(word=s2t(w.word), start_ms=w.start_ms, end_ms=w.end_ms) for w in hans_words]
         sentences = build_sentences(tw_words)
-        transcript_json_path.write_text(
-            json.dumps(sentences_to_jsonable(sentences), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(f"  → {len(sentences)} sentences → {transcript_json_path.name}")
+        if sentences:
+            transcript_json_path.write_text(
+                json.dumps(sentences_to_jsonable(sentences), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"  → {len(sentences)} sentences → {transcript_json_path.name}")
+        else:
+            print("  → 0 sentences (not caching empty transcript)")
 
     if not sentences:
         print("Empty transcript; aborting.", file=sys.stderr)
