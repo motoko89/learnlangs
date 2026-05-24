@@ -1,59 +1,156 @@
 #!/usr/bin/env python3
-"""
-Mandarin YT Podcast Vocabulary Extractor
+"""Mandarin YouTube → Vocab Listening-Practice Generator.
 
-Takes an MP3 path, transcribes it with Google Cloud Speech-to-Text
-(cmn-Hans-CN — the only Mandarin variant that supports diarization on Chirp),
-converts the Simplified output to Traditional (zh-TW) with OpenCC,
-segments with jieba, identifies important vocabulary (frequent / rare / proper
-nouns / NER entities), enriches with pinyin (Azure) + English (Google Translate),
-and writes a TSV next to the MP3.
+End-to-end pipeline:
+  1. Prompt for a YouTube URL.
+  2. Download audio (yt-dlp -x mp3) into ./inputs/.
+  3. Transcribe with Google Chirp v2 (cmn-Hans-CN), with word-level timestamps.
+     Convert Hans → Hant-TW via OpenCC. Cache JSON.
+  4. Tokenize with jieba and count occurrences.
+  5. Interactively pick X most-occurring + X least-occurring NEW words
+     (single keypress: 1 = NEW, 2 = mark KNOWN/append to hsk1to4_zh-TW.txt).
+  6. Slice the source audio into ~10-min chunks snapped to sentence ends.
+  7. For each sentence containing ≥1 new word, render an Azure TTS explanation
+     clip = word(s) + English meaning(s) + original sentence slice + synthetic
+     sentence TTS + English sentence translation, with 500 ms breaks.
+  8. Assemble each chunk:
+       original_chunk + 1s + part1 + expl1 + 1s + part2 + expl2 + 1s + … + tail
+     and concatenate all chunks (2s between chunks) into outputs/<stem>.mp3.
+
+I/O folders (created at invocation cwd):
+  inputs/                 - downloaded MP3
+  intermediates/<stem>/   - transcript.json, vocab.tsv, tts/, chunks/
+  outputs/                - final concatenated study MP3
+
+Credentials (next to this script):
+  key.json       - {"key": "<Google API key>",
+                    "azDictKey": "<Azure Cognitive Services key>",
+                    "azSpeechRegion": "<e.g. eastus>",
+                    "gcsBucket": "<GCS bucket for STT staging>"}
+  jumeau-gc.json - Google Cloud service account JSON
 
 Dependencies:
   pip install -r requirements.txt
-  brew install ffmpeg   # macOS — pydub MP3 decode
-
-Credentials (reused from adhocscripts/):
-  key.json       - {"key": "<Google API key>", "azDictKey": "<Azure key>"}
-  jumeau-gc.json - Google Cloud service account JSON
-
-Usage:
-  python3 extract_vocab.py mp3/episode.mp3 --gcs-bucket jumeau-stt-staging
-  python3 extract_vocab.py mp3/MCP-003-SufferDepressionChina.mp3 --gcs-bucket kzsadhoclanguagelearning 
-  python3 extract_vocab.py mp3/episode.mp3 --gcs-bucket jumeau-stt-staging --min-count 5
+  brew install ffmpeg   # pydub MP3 decode; also used by yt-dlp
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import html
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
 from pydub import AudioSegment
 
-LANGUAGE_CODE = "cmn-Hans-CN"  # only Hans-CN supports diarization on Chirp; output is post-converted to Hant-TW
+LANGUAGE_CODE = "cmn-Hans-CN"
 TARGET_SAMPLE_RATE = 16000
 TARGET_CHANNELS = 1
 CHIRP_LOCATION = "us"
 
+TW_VOICE = "zh-TW-YunJheNeural"
+EN_VOICE = "en-US-AvaNeural"
+TTS_RATE = "0.9"
+INTRA_GROUP_BREAK_MS = 500
+INTER_PART_BREAK_MS = 1000
+INTER_CHUNK_BREAK_MS = 2000
+CHUNK_TARGET_MS = 10 * 60 * 1000
+
+SENTENCE_END_CHARS = "。！？!?."
 PROPER_NOUN_POS = {"nr", "ns", "nt", "nz", "nrfg", "nrt"}
 SKIP_POS = {"u", "uj", "ul", "ud", "uv", "uz", "ug", "p", "c", "y", "e", "o", "x", "w", "m"}
-KEEP_ENTITY_TYPES = {"PERSON", "LOCATION", "ORGANIZATION", "EVENT", "WORK_OF_ART"}
-
 PUNCT_OR_DIGIT_RE = re.compile(r"^[\W\d_]+$", re.UNICODE)
-HAN_ONLY_RE = re.compile(r"^[㐀-䶿一-鿿豈-﫿]+$")
+HAN_ONLY_RE = re.compile(r"^[㐀-䶿一-鿿豈-﫿]+$")
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+HSK_PATH = SCRIPT_DIR / "hsk1to4_zh-TW.txt"
+HSK_HEADER = (
+    "# HSK 1-4 vocabulary list — traditional Chinese characters\n"
+    "# Words NOT in this list are flagged as candidates by ytconverter.py.\n"
+    "# Add one traditional word per line; lines starting with '#' are ignored.\n\n"
+)
+
+
+# ─── Single-keypress input ────────────────────────────────────────────────────
+
+def getch() -> str:
+    """Read a single character from stdin with no Enter required (POSIX)."""
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    return ch
+
+
+# ─── Bootstrap / config ───────────────────────────────────────────────────────
 
 def load_keys(path: Path) -> dict:
     with open(path, encoding="utf-8-sig") as f:
         return json.load(f)
 
+
+def ensure_hsk_file(path: Path) -> None:
+    if not path.exists():
+        path.write_text(HSK_HEADER, encoding="utf-8")
+        print(f"  created empty HSK list: {path}")
+
+
+def ensure_dirs(*paths: Path) -> None:
+    for p in paths:
+        p.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_stem(stem: str) -> str:
+    """Make a filesystem-safe stem (also used as cache directory name)."""
+    cleaned = re.sub(r"[^\w\-. ]+", "_", stem, flags=re.UNICODE).strip()
+    return cleaned or f"episode-{int(time.time())}"
+
+
+# ─── yt-dlp download ──────────────────────────────────────────────────────────
+
+def download_youtube(url: str, inputs_dir: Path) -> Path:
+    """Run yt-dlp and return the path to the downloaded MP3."""
+    ensure_dirs(inputs_dir)
+    output_template = str(inputs_dir / "%(title)s.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-f", "bestaudio",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "-o", output_template,
+        "--print", "after_move:filepath",
+        "--no-simulate",
+        url,
+    ]
+    print(f"  → yt-dlp: {url}")
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not paths:
+        raise RuntimeError(f"yt-dlp did not report an output filepath. stderr:\n{result.stderr}")
+    return Path(paths[-1]).resolve()
+
+
+# ─── Audio convert + GCS upload (reused from prior version) ───────────────────
 
 def convert_mp3_to_flac(mp3_path: Path, out_path: Path) -> None:
     audio = AudioSegment.from_mp3(str(mp3_path))
@@ -68,14 +165,24 @@ def upload_to_gcs(local_path: Path, bucket_name: str, blob_name: str):
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_filename(str(local_path))
-    return f"gs://{bucket_name}/{blob_name}", client, blob
+    return f"gs://{bucket_name}/{blob_name}", blob
 
 
-def transcribe(gcs_uri: str, project_id: str) -> tuple[str, str]:
-    """Transcribe GCS audio with Chirp (Speech v2) + diarization.
+# ─── Chirp transcription (with word-level timestamps) ─────────────────────────
 
-    Returns (plain_transcript, speaker_labeled_transcript).
-    """
+@dataclass
+class WordRec:
+    word: str
+    start_ms: int
+    end_ms: int
+
+
+def _duration_to_ms(d) -> int:
+    return int(d.seconds * 1000 + d.nanos // 1_000_000)
+
+
+def transcribe(gcs_uri: str, project_id: str) -> list[WordRec]:
+    """Chirp v2 BatchRecognize. Returns flat ordered list of word records (Hans)."""
     from google.api_core.client_options import ClientOptions
     from google.cloud.speech_v2 import SpeechClient
     from google.cloud.speech_v2.types import cloud_speech
@@ -84,20 +191,15 @@ def transcribe(gcs_uri: str, project_id: str) -> tuple[str, str]:
         client_options=ClientOptions(api_endpoint=f"{CHIRP_LOCATION}-speech.googleapis.com")
     )
     recognizer = f"projects/{project_id}/locations/{CHIRP_LOCATION}/recognizers/_"
-
     config = cloud_speech.RecognitionConfig(
         auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
         language_codes=[LANGUAGE_CODE],
-        model="chirp_3",  # Chirp 3 supports diarization for cmn-Hans-CN via BatchRecognize
+        model="chirp_3",
         features=cloud_speech.RecognitionFeatures(
             enable_automatic_punctuation=True,
-            diarization_config=cloud_speech.SpeakerDiarizationConfig(
-                min_speaker_count=2,
-                max_speaker_count=2,
-            ),
+            enable_word_time_offsets=True,
         ),
     )
-
     request = cloud_speech.BatchRecognizeRequest(
         recognizer=recognizer,
         config=config,
@@ -106,99 +208,180 @@ def transcribe(gcs_uri: str, project_id: str) -> tuple[str, str]:
             inline_response_config=cloud_speech.InlineOutputConfig(),
         ),
     )
-
-    print("  → STT v2 (chirp_3) BatchRecognize submitted; waiting (may take several minutes)...")
+    print("  → STT v2 (chirp_3) BatchRecognize submitted; waiting (minutes)...")
     operation = client.batch_recognize(request=request)
     response = operation.result(timeout=3600)
 
-    plain_parts = []
-    speaker_parts = []
+    words: list[WordRec] = []
     for file_result in response.results.values():
         for result in file_result.transcript.results:
             if not result.alternatives:
                 continue
             alt = result.alternatives[0]
-            plain_parts.append(alt.transcript.strip())
-            if alt.words and alt.words[0].speaker_label:
-                seg_words = []
-                current_speaker = alt.words[0].speaker_label
-                for word_info in alt.words:
-                    if word_info.speaker_label != current_speaker:
-                        speaker_parts.append(f"[{current_speaker}] {''.join(seg_words)}")
-                        seg_words = []
-                        current_speaker = word_info.speaker_label
-                    seg_words.append(word_info.word)
-                if seg_words:
-                    speaker_parts.append(f"[{current_speaker}] {''.join(seg_words)}")
-            else:
-                speaker_parts.append(alt.transcript.strip())
+            for wi in alt.words:
+                if not wi.word:
+                    continue
+                words.append(WordRec(
+                    word=wi.word,
+                    start_ms=_duration_to_ms(wi.start_offset),
+                    end_ms=_duration_to_ms(wi.end_offset),
+                ))
+    return words
 
-    return " ".join(plain_parts), "\n".join(speaker_parts)
 
+# ─── OpenCC s2tw ──────────────────────────────────────────────────────────────
 
 _S2T_CONVERTER = None
 
 
 def s2t(text: str) -> str:
-    """Simplified (cmn-Hans-CN STT output) → Traditional (zh-TW) via OpenCC."""
     global _S2T_CONVERTER
     if _S2T_CONVERTER is None:
         from opencc import OpenCC
-
         _S2T_CONVERTER = OpenCC("s2tw")
     return _S2T_CONVERTER.convert(text)
 
 
-def tokenize(text: str):
-    """Returns list of (word, pos). Filters punctuation, digits, particles, most 1-char tokens."""
+# ─── Sentence segmentation from word records ──────────────────────────────────
+
+@dataclass
+class Sentence:
+    text: str
+    start_ms: int
+    end_ms: int
+    words: list[WordRec] = field(default_factory=list)
+
+
+def build_sentences(words: list[WordRec]) -> list[Sentence]:
+    """Group word records into sentences by trailing punctuation."""
+    sentences: list[Sentence] = []
+    buf: list[WordRec] = []
+    for w in words:
+        buf.append(w)
+        if w.word and w.word[-1] in SENTENCE_END_CHARS:
+            text = "".join(x.word for x in buf).strip()
+            sentences.append(Sentence(
+                text=text,
+                start_ms=buf[0].start_ms,
+                end_ms=buf[-1].end_ms,
+                words=buf,
+            ))
+            buf = []
+    if buf:
+        text = "".join(x.word for x in buf).strip()
+        sentences.append(Sentence(
+            text=text,
+            start_ms=buf[0].start_ms,
+            end_ms=buf[-1].end_ms,
+            words=buf,
+        ))
+    return sentences
+
+
+def sentences_to_jsonable(sentences: list[Sentence]) -> list[dict]:
+    return [
+        {
+            "text": s.text,
+            "start_ms": s.start_ms,
+            "end_ms": s.end_ms,
+            "words": [{"w": w.word, "s": w.start_ms, "e": w.end_ms} for w in s.words],
+        }
+        for s in sentences
+    ]
+
+
+def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
+    out = []
+    for r in rows:
+        out.append(Sentence(
+            text=r["text"],
+            start_ms=r["start_ms"],
+            end_ms=r["end_ms"],
+            words=[WordRec(word=w["w"], start_ms=w["s"], end_ms=w["e"]) for w in r["words"]],
+        ))
+    return out
+
+
+# ─── Tokenization ─────────────────────────────────────────────────────────────
+
+def tokenize(text: str) -> list[tuple[str, str]]:
     import jieba.posseg as pseg
 
-    out = []
+    out: list[tuple[str, str]] = []
     for w, pos in pseg.cut(text, HMM=True):
         w = w.strip()
         if not w or PUNCT_OR_DIGIT_RE.match(w):
             continue
         if pos in SKIP_POS:
             continue
-        # Drop most 1-char words; keep 1-char proper nouns (some surnames/places are 1 char)
         if len(w) < 2 and pos not in PROPER_NOUN_POS:
             continue
         out.append((w, pos))
     return out
 
 
-def load_hsk(path: Path) -> set:
+def load_hsk(path: Path) -> set[str]:
     if not path.exists():
-        print(f"  (HSK list not found at {path.name}; 'rare' flagging disabled)")
         return set()
     with open(path, encoding="utf-8-sig") as f:
         return {line.strip() for line in f if line.strip() and not line.startswith("#")}
 
 
-def extract_entities(text: str) -> dict:
-    """{word -> set of 'entity:TYPE' strings} via Google NL API."""
-    from google.cloud import language_v1
+def append_to_hsk(path: Path, word: str) -> None:
+    data = path.read_bytes() if path.exists() else b""
+    needs_newline = data and not data.endswith(b"\n")
+    with open(path, "ab") as f:
+        if needs_newline:
+            f.write(b"\n")
+        f.write(word.encode("utf-8") + b"\n")
 
-    client = language_v1.LanguageServiceClient()
-    document = language_v1.Document(
-        content=text,
-        type_=language_v1.Document.Type.PLAIN_TEXT,
-        language="zh",
+
+# ─── Interactive vocab picker ─────────────────────────────────────────────────
+
+def pick_round(
+    label: str,
+    counts: Counter,
+    hsk: set[str],
+    target: int,
+    least_first: bool,
+) -> dict[str, int]:
+    """Iterate candidates and prompt single-keypress 1=NEW, 2=KNOWN, q=stop.
+    Returns dict {word: count} for accepted-as-new words."""
+    sign = 1 if least_first else -1
+    ordered = sorted(
+        counts.items(),
+        key=lambda x: (sign * x[1], -len(x[0]), x[0]),
     )
-    response = client.analyze_entities(request={"document": document})
-    out = {}
-    for entity in response.entities:
-        type_name = language_v1.Entity.Type(entity.type_).name
-        if type_name not in KEEP_ENTITY_TYPES:
+    picked: dict[str, int] = {}
+    print(f"\n── {label} — pick up to {target}; 1=NEW, 2=KNOWN, q=stop round ──")
+    for word, count in ordered:
+        if word in hsk:
             continue
-        out.setdefault(entity.name, set()).add(f"entity:{type_name}")
-        for mention in entity.mentions:
-            out.setdefault(mention.text.content, set()).add(f"entity:{type_name}")
-    return {k: sorted(v) for k, v in out.items()}
+        if not HAN_ONLY_RE.match(word):
+            continue
+        print(f"  [{count:>3}× len={len(word)}] {word}  ", end="", flush=True)
+        ch = getch()
+        print(ch)
+        if ch == "1":
+            picked[word] = count
+            print(f"    → NEW ({len(picked)}/{target})")
+            if len(picked) >= target:
+                break
+        elif ch == "2":
+            hsk.add(word)
+            append_to_hsk(HSK_PATH, word)
+            print("    → KNOWN (added to HSK)")
+        elif ch.lower() == "q":
+            print("    → stop")
+            break
+        else:
+            print("    → skip")
+    return picked
 
+
+# ─── Pinyin + translation ─────────────────────────────────────────────────────
 
 def transliterate(text: str, az_key: str) -> str:
-    """zh-Hant → Pinyin via Azure Cognitive Services Translator."""
     url = (
         "https://api.cognitive.microsofttranslator.com/transliterate"
         "?api-version=3.0&language=zh-Hant&fromScript=Hant&toScript=Latn"
@@ -207,6 +390,7 @@ def transliterate(text: str, az_key: str) -> str:
         url,
         headers={"Ocp-Apim-Subscription-Key": az_key, "Content-Type": "application/json"},
         json=[{"Text": text}],
+        timeout=30,
     )
     resp.raise_for_status()
     result = resp.json()
@@ -215,195 +399,372 @@ def transliterate(text: str, az_key: str) -> str:
     return ""
 
 
-def translate_batch(words: list, translate_url: str, batch_size: int = 100) -> dict:
-    """Translate a list of words to English in batches. Returns {word: english}."""
-    out = {}
-    for i in range(0, len(words), batch_size):
-        chunk = words[i : i + batch_size]
+def translate_batch(texts: list[str], translate_url: str, batch_size: int = 100) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i : i + batch_size]
         resp = requests.post(
             translate_url,
             json={"q": chunk, "target": "en", "source": "zh-TW", "format": "text"},
+            timeout=60,
         )
         resp.raise_for_status()
         translations = resp.json().get("data", {}).get("translations", [])
-        for word, t in zip(chunk, translations):
-            out[word] = t.get("translatedText", "")
+        for src, t in zip(chunk, translations):
+            out[src] = t.get("translatedText", "")
     return out
 
 
+# ─── Audio chunking by sentence ───────────────────────────────────────────────
+
+@dataclass
+class Chunk:
+    idx: int
+    start_ms: int
+    end_ms: int
+    sentences: list[Sentence]
+
+
+def chunk_sentences(sentences: list[Sentence], target_ms: int = CHUNK_TARGET_MS) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    current: list[Sentence] = []
+    start_ms = sentences[0].start_ms if sentences else 0
+    for s in sentences:
+        current.append(s)
+        if current[-1].end_ms - start_ms >= target_ms:
+            chunks.append(Chunk(
+                idx=len(chunks) + 1,
+                start_ms=start_ms,
+                end_ms=current[-1].end_ms,
+                sentences=current,
+            ))
+            current = []
+            start_ms = s.end_ms
+    if current:
+        chunks.append(Chunk(
+            idx=len(chunks) + 1,
+            start_ms=start_ms,
+            end_ms=current[-1].end_ms,
+            sentences=current,
+        ))
+    return chunks
+
+
+# ─── Azure TTS (cached) ───────────────────────────────────────────────────────
+
+def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> AudioSegment:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    sha = hashlib.sha1(ssml.encode("utf-8")).hexdigest()
+    out_path = cache_dir / f"{sha}.mp3"
+    if not out_path.exists():
+        import azure.cognitiveservices.speech as speechsdk
+
+        speech_config = speechsdk.SpeechConfig(subscription=az_key, region=az_region)
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3
+        )
+        audio_config = speechsdk.audio.AudioOutputConfig(filename=str(out_path))
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+        result = synthesizer.speak_ssml_async(ssml).get()
+        if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+            details = getattr(result, "cancellation_details", None)
+            err = details.error_details if details else "unknown"
+            try:
+                out_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise RuntimeError(f"Azure TTS failed: {result.reason} / {err}")
+    return AudioSegment.from_mp3(str(out_path))
+
+
+def _voice(name: str, text: str) -> str:
+    return (
+        f'<voice name="{name}">'
+        f'<prosody rate="{TTS_RATE}">{html.escape(text)}</prosody>'
+        f'</voice>'
+    )
+
+
+def _wrap_ssml(body: str) -> str:
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="zh-TW">'
+        + body
+        + '</speak>'
+    )
+
+
+def ssml_words_and_meanings(pairs: list[tuple[str, str]]) -> str:
+    """pairs = [(traditional_word, english_meaning), ...]"""
+    parts: list[str] = []
+    for i, (w, en) in enumerate(pairs):
+        if i:
+            parts.append(f'<break time="{INTRA_GROUP_BREAK_MS}ms"/>')
+        parts.append(_voice(TW_VOICE, w))
+        parts.append(f'<break time="{INTRA_GROUP_BREAK_MS}ms"/>')
+        parts.append(_voice(EN_VOICE, en or "(no translation)"))
+    return _wrap_ssml("".join(parts))
+
+
+def ssml_sentence_pair(zh_text: str, en_text: str) -> str:
+    body = (
+        _voice(TW_VOICE, zh_text)
+        + f'<break time="{INTRA_GROUP_BREAK_MS}ms"/>'
+        + _voice(EN_VOICE, en_text or "(no translation)")
+    )
+    return _wrap_ssml(body)
+
+
+# ─── Per-sentence explanation clip ────────────────────────────────────────────
+
+def build_explanation_clip(
+    sentence: Sentence,
+    new_words_in_order: list[str],
+    word_meanings: dict[str, str],
+    sentence_translation: str,
+    original_audio: AudioSegment,
+    tts_cache: Path,
+    az_key: str,
+    az_region: str,
+) -> AudioSegment:
+    pairs = [(w, word_meanings.get(w, "")) for w in new_words_in_order]
+    clip_a = render_tts(ssml_words_and_meanings(pairs), tts_cache, az_key, az_region)
+    original_slice = original_audio[sentence.start_ms : sentence.end_ms]
+    clip_b = render_tts(
+        ssml_sentence_pair(sentence.text, sentence_translation),
+        tts_cache, az_key, az_region,
+    )
+    gap = AudioSegment.silent(duration=INTRA_GROUP_BREAK_MS)
+    return clip_a + gap + original_slice + gap + clip_b
+
+
+# ─── Chunk assembly ───────────────────────────────────────────────────────────
+
+def assemble_chunk(
+    chunk: Chunk,
+    original_audio: AudioSegment,
+    explanations_by_sentence: dict[int, AudioSegment],
+    sentence_index: dict[int, int],
+) -> AudioSegment:
+    """Build: original_chunk + 1s + (part + expl + 1s)* + tail."""
+    out = original_audio[chunk.start_ms : chunk.end_ms]
+    out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
+
+    cursor = chunk.start_ms
+    new_word_sentences = [s for s in chunk.sentences if sentence_index[id(s)] in explanations_by_sentence]
+    for s in new_word_sentences:
+        out += original_audio[cursor : s.end_ms]
+        out += explanations_by_sentence[sentence_index[id(s)]]
+        out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
+        cursor = s.end_ms
+    if cursor < chunk.end_ms:
+        out += original_audio[cursor : chunk.end_ms]
+    return out
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Extract important Mandarin vocabulary from a YT podcast MP3."
-    )
-    parser.add_argument("mp3_path", help="Path to the MP3 file")
-    parser.add_argument("--gcs-bucket", required=True, help="GCS bucket for STT staging (e.g. jumeau-stt-staging)")
-    parser.add_argument("--top", type=int, default=50, help="Cap on rows in output TSV (default: 50; 0 = no cap)")
-    parser.add_argument(
-        "--keys",
-        default=str(Path(__file__).parent.parent / "key.json"),
-        help="Path to key.json (default: ../key.json)",
-    )
-    parser.add_argument(
-        "--gc",
-        default=str(Path(__file__).parent.parent / "jumeau-gc.json"),
-        help="Path to Google Cloud service account JSON (default: ../jumeau-gc.json)",
-    )
-    parser.add_argument(
-        "--hsk",
-        default=str(Path(__file__).parent / "hsk1to4_zh-TW.txt"),
-        help="Path to HSK 1-4 word list, one traditional word per line",
-    )
-    parser.add_argument("--output", help="Output TSV path (default: <mp3>.vocab.tsv)")
-    parser.add_argument("--skip-ner", action="store_true", help="Skip Google Natural Language API entity pass")
-    parser.add_argument("--least-occur", action="store_true", help="Iterate words from least to most occurrences (default is most to least)")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("url", nargs="?", help="YouTube URL (prompted if omitted)")
+    parser.add_argument("--keys", default=str(SCRIPT_DIR / "key.json"))
+    parser.add_argument("--gc", default=str(SCRIPT_DIR / "jumeau-gc.json"))
+    parser.add_argument("--gcs-bucket", help="GCS bucket for STT staging (else read from key.json:gcsBucket)")
+    parser.add_argument("--azure-region", help="Azure Speech region (else read from key.json:azSpeechRegion)")
+    parser.add_argument("--chunk-minutes", type=float, default=10.0)
     args = parser.parse_args()
 
-    mp3_path = Path(args.mp3_path).resolve()
-    if not mp3_path.exists():
-        print(f"MP3 not found: {mp3_path}", file=sys.stderr)
-        sys.exit(1)
+    ensure_hsk_file(HSK_PATH)
 
-    output_path = Path(args.output).resolve() if args.output else mp3_path.with_suffix(".vocab.tsv")
-    transcript_path = mp3_path.with_suffix(".transcript.txt")
-    speaker_transcript_path = mp3_path.with_suffix(".speakers.txt")
+    cwd = Path.cwd()
+    inputs_dir = cwd / "inputs"
+    intermediates_root = cwd / "intermediates"
+    outputs_dir = cwd / "outputs"
+    ensure_dirs(inputs_dir, intermediates_root, outputs_dir)
 
     keys = load_keys(Path(args.keys))
     az_key = keys["azDictKey"]
+    az_region = args.azure_region or keys.get("azSpeechRegion")
+    if not az_region:
+        az_region = input("Azure Speech region (e.g. eastus): ").strip()
+    gcs_bucket = args.gcs_bucket or keys.get("gcsBucket")
+    if not gcs_bucket:
+        gcs_bucket = input("GCS bucket for STT staging: ").strip()
     translate_url = "https://translation.googleapis.com/language/translate/v2?key=" + keys["key"]
+
     gc_path = Path(args.gc).resolve()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(gc_path)
     with open(gc_path, encoding="utf-8") as f:
         project_id = json.load(f)["project_id"]
 
-    # ---- 1. Transcribe (cached) ---------------------------------------------
-    if transcript_path.exists() and transcript_path.stat().st_size > 0:
-        print(f"[1/5] transcript cached: {transcript_path.name}")
-        transcript = transcript_path.read_text(encoding="utf-8")
+    url = args.url or input("YouTube URL: ").strip()
+    if not url:
+        print("No URL provided.", file=sys.stderr)
+        sys.exit(1)
+
+    # ── 1. Download ─────────────────────────────────────────────────────────
+    print("\n[1/7] download")
+    mp3_path = download_youtube(url, inputs_dir)
+    stem = sanitize_stem(mp3_path.stem)
+    print(f"  → {mp3_path}")
+
+    inter_dir = intermediates_root / stem
+    tts_cache = inter_dir / "tts"
+    chunks_cache = inter_dir / "chunks"
+    transcript_json_path = inter_dir / "transcript.json"
+    vocab_tsv_path = inter_dir / "vocab.tsv"
+    ensure_dirs(inter_dir, tts_cache, chunks_cache)
+
+    # ── 2. Transcribe (cached) ──────────────────────────────────────────────
+    print("\n[2/7] transcribe")
+    if transcript_json_path.exists() and transcript_json_path.stat().st_size > 0:
+        print(f"  cached: {transcript_json_path.name}")
+        sentences = sentences_from_jsonable(json.loads(transcript_json_path.read_text(encoding="utf-8")))
     else:
-        print(f"[1/5] transcribe: {mp3_path.name}")
         with tempfile.TemporaryDirectory() as td:
-            flac_path = Path(td) / (mp3_path.stem + ".flac")
+            flac_path = Path(td) / (stem + ".flac")
             print(f"  → MP3 → FLAC ({TARGET_SAMPLE_RATE}Hz mono)")
             convert_mp3_to_flac(mp3_path, flac_path)
-            blob_name = f"stt-staging/{mp3_path.stem}-{int(time.time())}.flac"
-            print(f"  → upload to gs://{args.gcs_bucket}/{blob_name}")
-            gcs_uri, gcs_client, blob = upload_to_gcs(flac_path, args.gcs_bucket, blob_name)
+            blob_name = f"stt-staging/{stem}-{int(time.time())}.flac"
+            print(f"  → upload to gs://{gcs_bucket}/{blob_name}")
+            gcs_uri, blob = upload_to_gcs(flac_path, gcs_bucket, blob_name)
             try:
-                transcript, speaker_transcript = transcribe(gcs_uri, project_id)
+                hans_words = transcribe(gcs_uri, project_id)
             finally:
                 try:
                     blob.delete()
                 except Exception as e:
                     print(f"  (warning: failed to delete staged blob: {e})", file=sys.stderr)
-        print("  → OpenCC s2tw: Hans-CN → Hant-TW")
-        transcript = s2t(transcript)
-        speaker_transcript = s2t(speaker_transcript)
-        transcript_path.write_text(transcript, encoding="utf-8")
-        speaker_transcript_path.write_text(speaker_transcript, encoding="utf-8")
-        print(f"  → wrote {transcript_path.name} ({len(transcript)} chars)")
-        print(f"  → wrote {speaker_transcript_path.name}")
+        print(f"  → {len(hans_words)} word records; OpenCC s2tw")
+        tw_words = [WordRec(word=s2t(w.word), start_ms=w.start_ms, end_ms=w.end_ms) for w in hans_words]
+        sentences = build_sentences(tw_words)
+        transcript_json_path.write_text(
+            json.dumps(sentences_to_jsonable(sentences), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"  → {len(sentences)} sentences → {transcript_json_path.name}")
 
-    if not transcript.strip():
-        print("Empty transcript; nothing to extract.", file=sys.stderr)
+    if not sentences:
+        print("Empty transcript; aborting.", file=sys.stderr)
         sys.exit(1)
 
-    # ---- 2. Tokenize --------------------------------------------------------
-    print("[2/5] tokenize")
-    tokens = tokenize(transcript)
+    transcript_text = "".join(s.text for s in sentences)
+
+    # ── 3. Tokenize + count ─────────────────────────────────────────────────
+    print("\n[3/7] tokenize")
+    tokens = tokenize(transcript_text)
     counts = Counter(w for w, _ in tokens)
-    pos_for = {}
-    for w, pos in tokens:
-        pos_for.setdefault(w, pos)
     print(f"  → {sum(counts.values())} kept tokens, {len(counts)} unique")
 
-    # ---- 3. Score importance ------------------------------------------------
-    print("[3/5] score importance")
-    hsk = load_hsk(Path(args.hsk))
-
-    entities = {}
-    if args.skip_ner:
-        print("  (--skip-ner)")
-    elif len(transcript) > 100_000:
-        print(f"  (transcript {len(transcript)} chars > 100k; skipping NL API)")
-    else:
-        try:
-            entities = extract_entities(transcript)
-            print(f"  → Google NL API: {len(entities)} distinct entity surface forms")
-        except Exception as e:
-            print(f"  (NL API failed: {e})", file=sys.stderr)
-
-    important = {}
-    hsk_path = Path(args.hsk)
-    if hsk_path.exists():
-        data = hsk_path.read_bytes()
-        if data and not data.endswith(b"\n"):
-            with open(hsk_path, "ab") as _f:
-                _f.write(b"\n")
-    with open(hsk_path, "a", encoding="utf-8") as hsk_file:
-        count_sign = 1 if args.least_occur else -1
-        for word, count in sorted(counts.items(), key=lambda x: (count_sign * x[1], -len(x[0]), x[0])):
-            if hsk and word in hsk:
-                continue
-            if not HAN_ONLY_RE.match(word):
-                continue
-            ans = input(f"  New word: {word!r} (count={count}) — Enter=accept, any char+Enter=reject: ")
-            if ans:
-                hsk.add(word)
-                hsk_file.write(word + "\n")
-                hsk_file.flush()
-                continue
-            cats = []
-            if pos_for.get(word) in PROPER_NOUN_POS:
-                cats.append("proper_noun")
-            if word in entities:
-                cats.extend(entities[word])
-            if not cats:
-                cats.append("user_accepted")
-            important[word] = (count, cats)
-            if args.top and args.top > 0 and len(important) == args.top:
-                break
-
-    sorted_words = list(important.items())
-    print(f"  → kept {len(sorted_words)} important words")
-
-    if not sorted_words:
-        print("No important vocabulary found. Try lowering --min-count.", file=sys.stderr)
+    # ── 4. Interactive vocab picker ─────────────────────────────────────────
+    print("\n[4/7] vocab")
+    try:
+        x = int(input("How many new words per round (X): ").strip() or "10")
+    except ValueError:
+        x = 10
+    hsk = load_hsk(HSK_PATH)
+    picked_most = pick_round("MOST occurring", counts, hsk, target=x, least_first=False)
+    picked_least = pick_round("LEAST occurring", counts, hsk, target=x, least_first=True)
+    new_words: dict[str, int] = {**picked_most, **picked_least}
+    print(f"\n  → {len(new_words)} total new words")
+    if not new_words:
+        print("No new words picked; nothing to synthesize. Exiting.")
         sys.exit(0)
 
-    # ---- 4. Enrich ----------------------------------------------------------
-    print("[4/5] enrich (pinyin + English)")
-    words_only = [w for w, _ in sorted_words]
+    # ── 5. Enrich (pinyin + per-word + per-sentence translation) ────────────
+    print("\n[5/7] enrich (translate words + sentences, pinyin)")
+    words_list = list(new_words.keys())
     try:
-        translations = translate_batch(words_only, translate_url)
+        word_meanings = translate_batch(words_list, translate_url)
     except Exception as e:
-        print(f"  (translate batch failed: {e}; rows will have empty english)", file=sys.stderr)
-        translations = {}
+        print(f"  (word translate failed: {e})", file=sys.stderr)
+        word_meanings = {w: "" for w in words_list}
 
-    pinyin_map = {}
-    for i, w in enumerate(words_only, 1):
+    pinyin_map: dict[str, str] = {}
+    for i, w in enumerate(words_list, 1):
         try:
             pinyin_map[w] = transliterate(w, az_key)
         except Exception as e:
             print(f"    pinyin failed for {w!r}: {e}", file=sys.stderr)
             pinyin_map[w] = ""
         if i % 25 == 0:
-            print(f"    pinyin [{i}/{len(words_only)}]")
+            print(f"    pinyin [{i}/{len(words_list)}]")
 
-    # ---- 5. Write TSV -------------------------------------------------------
-    print(f"[5/5] write TSV: {output_path}")
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
+    # Identify which sentences contain ≥1 new word (preserve order of new words in sentence)
+    new_word_set = set(words_list)
+    sentence_new_words: dict[int, list[str]] = {}
+    for idx, s in enumerate(sentences):
+        seen: list[str] = []
+        for w, _ in tokenize(s.text):
+            if w in new_word_set and w not in seen:
+                seen.append(w)
+        if seen:
+            sentence_new_words[idx] = seen
+    print(f"  → {len(sentence_new_words)} sentences contain ≥1 new word")
+
+    if not sentence_new_words:
+        print("None of the picked words appear in sentence-level tokens; aborting.")
+        sys.exit(0)
+
+    nw_sentence_texts = [sentences[idx].text for idx in sentence_new_words]
+    try:
+        sentence_translations_raw = translate_batch(nw_sentence_texts, translate_url, batch_size=50)
+    except Exception as e:
+        print(f"  (sentence translate failed: {e})", file=sys.stderr)
+        sentence_translations_raw = {}
+
+    with open(vocab_tsv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter="\t", lineterminator="\n")
-        for word, (count, cats) in sorted_words:
-            writer.writerow([
-                word,
-                pinyin_map.get(word, ""),
-                translations.get(word, ""),
-                ";".join(cats),
-                count,
-            ])
+        writer.writerow(["word", "pinyin", "english", "count"])
+        for w in words_list:
+            writer.writerow([w, pinyin_map.get(w, ""), word_meanings.get(w, ""), new_words[w]])
+    print(f"  → wrote {vocab_tsv_path.name}")
 
-    print(f"\nDone! {len(sorted_words)} rows → {output_path}")
-    print(f"      transcript → {transcript_path}")
+    # ── 6. Load source audio + chunk ────────────────────────────────────────
+    print("\n[6/7] chunk audio")
+    print(f"  → loading {mp3_path.name}")
+    original_audio = AudioSegment.from_mp3(str(mp3_path))
+    chunk_target_ms = int(args.chunk_minutes * 60 * 1000)
+    chunks = chunk_sentences(sentences, target_ms=chunk_target_ms)
+    print(f"  → {len(chunks)} chunks (target {args.chunk_minutes:.1f} min each)")
+
+    # ── 7. Build explanation clips, assemble chunks, concat ─────────────────
+    print("\n[7/7] synth + assemble")
+    sentence_index: dict[int, int] = {id(s): idx for idx, s in enumerate(sentences)}
+    explanations: dict[int, AudioSegment] = {}
+    for n, (idx, nws) in enumerate(sentence_new_words.items(), 1):
+        s = sentences[idx]
+        translation = sentence_translations_raw.get(s.text, "")
+        explanations[idx] = build_explanation_clip(
+            sentence=s,
+            new_words_in_order=nws,
+            word_meanings=word_meanings,
+            sentence_translation=translation,
+            original_audio=original_audio,
+            tts_cache=tts_cache,
+            az_key=az_key,
+            az_region=az_region,
+        )
+        if n % 5 == 0 or n == len(sentence_new_words):
+            print(f"  expl [{n}/{len(sentence_new_words)}]")
+
+    final = AudioSegment.silent(duration=0)
+    for c in chunks:
+        chunk_path = chunks_cache / f"chunk_{c.idx:02d}.mp3"
+        chunk_audio = assemble_chunk(
+            chunk=c,
+            original_audio=original_audio,
+            explanations_by_sentence=explanations,
+            sentence_index=sentence_index,
+        )
+        chunk_audio.export(str(chunk_path), format="mp3", bitrate="192k")
+        print(f"  → {chunk_path.name} ({len(chunk_audio) / 1000:.1f}s)")
+        final += chunk_audio
+        if c.idx != len(chunks):
+            final += AudioSegment.silent(duration=INTER_CHUNK_BREAK_MS)
+
+    final_path = outputs_dir / f"{stem}.mp3"
+    final.export(str(final_path), format="mp3", bitrate="192k")
+    print(f"\nDone! {len(final) / 1000:.1f}s → {final_path}")
 
 
 if __name__ == "__main__":

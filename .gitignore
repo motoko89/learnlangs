@@ -56,3 +56,8 @@ PLANNING.md
 jumeau-gc.json
 key.json
 hsk1to4_zh-TW.txt
+
+# ytconverter runtime folders (created in cwd at invocation time)
+inputs/
+intermediates/
+outputs/
