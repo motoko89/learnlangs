@@ -198,6 +198,10 @@ def transcribe(gcs_uri: str, project_id: str) -> list[WordRec]:
         features=cloud_speech.RecognitionFeatures(
             enable_automatic_punctuation=True,
             enable_word_time_offsets=True,
+            diarization_config=cloud_speech.SpeakerDiarizationConfig(
+                min_speaker_count=2,
+                max_speaker_count=3,
+            ),
         ),
     )
     request = cloud_speech.BatchRecognizeRequest(
@@ -213,11 +217,21 @@ def transcribe(gcs_uri: str, project_id: str) -> list[WordRec]:
     response = operation.result(timeout=3600)
 
     words: list[WordRec] = []
-    for file_result in response.results.values():
-        for result in file_result.transcript.results:
+    for uri, file_result in response.results.items():
+        err = getattr(file_result, "error", None)
+        if err and getattr(err, "code", 0):
+            print(f"  ! file error for {uri}: code={err.code} message={err.message}", file=sys.stderr)
+            continue
+        results = list(file_result.transcript.results) if file_result.transcript else []
+        print(f"  · {uri}: {len(results)} transcript result(s)")
+        for ri, result in enumerate(results):
             if not result.alternatives:
+                print(f"    [{ri}] no alternatives", file=sys.stderr)
                 continue
             alt = result.alternatives[0]
+            if ri == 0:
+                preview = (alt.transcript or "")[:80].replace("\n", " ")
+                print(f"    [{ri}] words={len(alt.words)} transcript[:80]={preview!r}")
             for wi in alt.words:
                 if not wi.word:
                     continue
