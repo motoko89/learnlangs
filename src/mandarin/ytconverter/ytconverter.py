@@ -189,6 +189,8 @@ class WordRec:
 
 
 def _duration_to_ms(d) -> int:
+    if hasattr(d, "total_seconds"):
+        return int(d.total_seconds() * 1000)
     return int(d.seconds * 1000 + d.nanos // 1_000_000)
 
 
