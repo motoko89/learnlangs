@@ -67,7 +67,9 @@ INTRA_GROUP_BREAK_MS = 500
 INTER_PART_BREAK_MS = 1000
 INTER_CHUNK_BREAK_MS = 2000
 CHUNK_TARGET_MS = 5 * 60 * 1000
-STT_CHUNK_MS = 18 * 60 * 1000  # under chirp_3's 20-min BatchRecognize limit
+SILENCE_LEN_MS = 500
+SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
+SILENCE_SEARCH_WINDOW_MS = 60 * 1000
 
 SENTENCE_END_CHARS = "。！？!?."
 SUB_SENTENCE_BREAK_CHARS = "，,、；;：:"
@@ -157,18 +159,41 @@ def download_youtube(url: str, inputs_dir: Path) -> Path:
 # ─── Audio convert + GCS upload (reused from prior version) ───────────────────
 
 def split_mp3_to_flac_chunks(
-    mp3_path: Path, chunk_ms: int, out_dir: Path
-) -> list[tuple[Path, int]]:
-    """Decode MP3 once, split into ≤chunk_ms FLAC pieces. Returns [(path, offset_ms)]."""
+    mp3_path: Path, target_ms: int, out_dir: Path
+) -> list[tuple[Path, int, int]]:
+    """Decode MP3 once, split at the closest ≥SILENCE_LEN_MS silence after each
+    target_ms mark. Returns [(path, start_ms, end_ms)]."""
+    from pydub.silence import detect_silence
+
     audio = AudioSegment.from_mp3(str(mp3_path))
     audio = audio.set_frame_rate(TARGET_SAMPLE_RATE).set_channels(TARGET_CHANNELS)
     total_ms = len(audio)
-    out: list[tuple[Path, int]] = []
-    for i, start in enumerate(range(0, total_ms, chunk_ms)):
-        end = min(start + chunk_ms, total_ms)
+    thresh = audio.dBFS + SILENCE_THRESH_DB
+
+    out: list[tuple[Path, int, int]] = []
+    start = 0
+    i = 0
+    while start < total_ms:
+        target_end = start + target_ms
+        if target_end >= total_ms:
+            end = total_ms
+        else:
+            search_end = min(target_end + SILENCE_SEARCH_WINDOW_MS, total_ms)
+            silences = detect_silence(
+                audio[target_end:search_end],
+                min_silence_len=SILENCE_LEN_MS,
+                silence_thresh=thresh,
+            )
+            if silences:
+                sil_start, sil_end = silences[0]
+                end = target_end + (sil_start + sil_end) // 2
+            else:
+                end = target_end
         chunk_path = out_dir / f"chunk_{i:03d}.flac"
         audio[start:end].export(str(chunk_path), format="flac")
-        out.append((chunk_path, start))
+        out.append((chunk_path, start, end))
+        start = end
+        i += 1
     return out
 
 
@@ -490,6 +515,25 @@ class Chunk:
     sentences: list[Sentence]
 
 
+def chunk_sentences_by_boundaries(
+    sentences: list[Sentence], boundaries: list[tuple[int, int]]
+) -> list[Chunk]:
+    """Group sentences into chunks using pre-computed audio boundaries
+    (start_ms, end_ms) from silence-aware splitting."""
+    chunks: list[Chunk] = []
+    for idx, (start_ms, end_ms) in enumerate(boundaries, 1):
+        chunk_sents = [s for s in sentences if start_ms <= s.start_ms < end_ms]
+        if not chunk_sents:
+            continue
+        chunks.append(Chunk(
+            idx=idx,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            sentences=chunk_sents,
+        ))
+    return chunks
+
+
 def chunk_sentences(sentences: list[Sentence], target_ms: int = CHUNK_TARGET_MS) -> list[Chunk]:
     chunks: list[Chunk] = []
     current: list[Sentence] = []
@@ -678,15 +722,19 @@ def main():
     tts_cache = inter_dir / "tts"
     chunks_cache = inter_dir / "chunks"
     transcript_json_path = inter_dir / "transcript.json"
+    boundaries_json_path = inter_dir / "chunk_boundaries.json"
     vocab_tsv_path = inter_dir / "vocab.tsv"
     for stale in (tts_cache, chunks_cache):
         if stale.exists():
             shutil.rmtree(stale)
     ensure_dirs(inter_dir, tts_cache, chunks_cache)
 
+    chunk_target_ms = int(args.chunk_minutes * 60 * 1000)
+
     # ── 2. Transcribe (cached) ──────────────────────────────────────────────
     print("\n[2/7] transcribe")
     cached_rows: list[dict] = []
+    boundaries: list[tuple[int, int]] | None = None
     if transcript_json_path.exists() and transcript_json_path.stat().st_size > 0:
         try:
             cached_rows = json.loads(transcript_json_path.read_text(encoding="utf-8"))
@@ -695,6 +743,13 @@ def main():
     if cached_rows:
         print(f"  cached: {transcript_json_path.name}")
         sentences = sentences_from_jsonable(cached_rows)
+        if boundaries_json_path.exists():
+            try:
+                raw = json.loads(boundaries_json_path.read_text(encoding="utf-8"))
+                boundaries = [(int(s), int(e)) for s, e in raw]
+                print(f"  cached: {boundaries_json_path.name} ({len(boundaries)} boundaries)")
+            except (json.JSONDecodeError, ValueError, TypeError):
+                boundaries = None
     else:
         try:
             speaker_count = int(input("How many speakers in the audio? ").strip() or "2")
@@ -705,12 +760,13 @@ def main():
         print(f"  → diarization: {speaker_count} speaker(s)")
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
-            print(f"  → MP3 → FLAC chunks ({TARGET_SAMPLE_RATE}Hz mono, ≤{STT_CHUNK_MS // 60000}min each)")
-            flac_chunks = split_mp3_to_flac_chunks(mp3_path, STT_CHUNK_MS, td_path)
+            print(f"  → MP3 → FLAC chunks ({TARGET_SAMPLE_RATE}Hz mono, ~{chunk_target_ms // 60000}min each, split at silence)")
+            flac_chunks = split_mp3_to_flac_chunks(mp3_path, chunk_target_ms, td_path)
             print(f"  → {len(flac_chunks)} chunk(s)")
+            boundaries = [(start, end) for _, start, end in flac_chunks]
             timestamp = int(time.time())
             uploaded: list[tuple[str, int, object]] = []  # (uri, offset_ms, blob)
-            for chunk_path, offset_ms in flac_chunks:
+            for chunk_path, offset_ms, _end_ms in flac_chunks:
                 blob_name = f"stt-staging/{stem}-{timestamp}-{chunk_path.stem}.flac"
                 print(f"  → upload to gs://{gcs_bucket}/{blob_name} (+{offset_ms}ms)")
                 gcs_uri, blob = upload_to_gcs(chunk_path, gcs_bucket, blob_name)
@@ -732,6 +788,10 @@ def main():
                 encoding="utf-8",
             )
             print(f"  → {len(sentences)} sentences → {transcript_json_path.name}")
+            boundaries_json_path.write_text(
+                json.dumps(boundaries), encoding="utf-8"
+            )
+            print(f"  → {len(boundaries)} boundaries → {boundaries_json_path.name}")
         else:
             print("  → 0 sentences (not caching empty transcript)")
 
@@ -820,9 +880,12 @@ def main():
     print("\n[6/7] chunk audio")
     print(f"  → loading {mp3_path.name}")
     original_audio = AudioSegment.from_mp3(str(mp3_path))
-    chunk_target_ms = int(args.chunk_minutes * 60 * 1000)
-    chunks = chunk_sentences(sentences, target_ms=chunk_target_ms)
-    print(f"  → {len(chunks)} chunks (target {args.chunk_minutes:.1f} min each)")
+    if boundaries:
+        chunks = chunk_sentences_by_boundaries(sentences, boundaries)
+        print(f"  → {len(chunks)} chunks (reused from silence-aware split)")
+    else:
+        chunks = chunk_sentences(sentences, target_ms=chunk_target_ms)
+        print(f"  → {len(chunks)} chunks (target {args.chunk_minutes:.1f} min each)")
 
     # ── 7. Build explanation clips, assemble chunks, concat ─────────────────
     print("\n[7/7] synth + assemble")
