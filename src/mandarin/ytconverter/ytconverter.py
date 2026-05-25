@@ -623,6 +623,16 @@ def ssml_sentence_pair(zh_text: str, en_text: str) -> str:
     return _wrap_ssml(body)
 
 
+def ssml_part_announcement(part_num: int, total_parts: int) -> str:
+    body = _voice(
+        EN_VOICE,
+        f"Part {part_num} of {total_parts}",
+        lead_break_ms=600,
+        trail_break_ms=600,
+    )
+    return _wrap_ssml(body)
+
+
 # ─── Per-sentence explanation clip ────────────────────────────────────────────
 
 def build_explanation_clip(
@@ -908,14 +918,20 @@ def main():
             print(f"  expl [{n}/{len(sentence_new_words)}]")
 
     final = AudioSegment.silent(duration=0)
+    total_chunks = len(chunks)
     for c in chunks:
         chunk_path = chunks_cache / f"chunk_{c.idx:02d}.mp3"
-        chunk_audio = assemble_chunk(
+        announcement = render_tts(
+            ssml_part_announcement(c.idx, total_chunks),
+            tts_cache, az_key, az_region,
+        )
+        chunk_body = assemble_chunk(
             chunk=c,
             original_audio=original_audio,
             explanations_by_sentence=explanations,
             sentence_index=sentence_index,
         )
+        chunk_audio = announcement + chunk_body
         chunk_audio.export(str(chunk_path), format="mp3", bitrate="192k")
         print(f"  → {chunk_path.name} ({len(chunk_audio) / 1000:.1f}s)")
         final += chunk_audio
