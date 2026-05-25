@@ -939,7 +939,16 @@ def main():
             final += AudioSegment.silent(duration=INTER_CHUNK_BREAK_MS)
 
     final_path = outputs_dir / f"{stem}.mp3"
-    final.export(str(final_path), format="mp3", bitrate="192k")
+    final.export(
+        str(final_path),
+        format="mp3",
+        bitrate="192k",
+        tags={
+            "title": stem,
+            "artist": "LearnLangs Youtube Converter",
+            "album": "LearnLangs Mandarin",
+        },
+    )
     print(f"\nDone! {len(final) / 1000:.1f}s → {final_path}")
 
 
