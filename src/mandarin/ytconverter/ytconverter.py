@@ -66,6 +66,7 @@ TTS_RATE = "0.9"
 INTRA_GROUP_BREAK_MS = 500
 INTER_PART_BREAK_MS = 1000
 INTER_CHUNK_BREAK_MS = 2000
+CHUNK_ANNOUNCEMENT_PAD_MS = 600
 CHUNK_TARGET_MS = 5 * 60 * 1000
 SILENCE_LEN_MS = 500
 SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
@@ -623,6 +624,10 @@ def ssml_sentence_pair(zh_text: str, en_text: str) -> str:
     return _wrap_ssml(body)
 
 
+def ssml_chunk_announcement(idx: int, total: int) -> str:
+    return _wrap_ssml(_voice(EN_VOICE, f"Playback part {idx} of {total}."))
+
+
 def ssml_part_announcement(part_num: int, total_parts: int) -> str:
     body = _voice(
         EN_VOICE,
@@ -660,13 +665,23 @@ def build_explanation_clip(
 
 def assemble_chunk(
     chunk: Chunk,
+    total_chunks: int,
     original_audio: AudioSegment,
     explanations_by_sentence: dict[int, AudioSegment],
     sentence_index: dict[int, int],
+    tts_cache: Path,
+    az_key: str,
+    az_region: str,
 ) -> AudioSegment:
-    """Build: original_chunk + 1s + (part + expl + 1s)* + tail."""
+    """Build: original_chunk + 1s + 600ms + announcement + 600ms + (part + expl + 1s)* + tail."""
     out = original_audio[chunk.start_ms : chunk.end_ms]
     out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
+    announcement = render_tts(
+        ssml_chunk_announcement(chunk.idx, total_chunks),
+        tts_cache, az_key, az_region,
+    )
+    pad = AudioSegment.silent(duration=CHUNK_ANNOUNCEMENT_PAD_MS)
+    out += pad + announcement + pad
 
     cursor = chunk.start_ms
     new_word_sentences = [s for s in chunk.sentences if sentence_index[id(s)] in explanations_by_sentence]
@@ -927,9 +942,13 @@ def main():
         )
         chunk_body = assemble_chunk(
             chunk=c,
+            total_chunks=total_chunks,
             original_audio=original_audio,
             explanations_by_sentence=explanations,
             sentence_index=sentence_index,
+            tts_cache=tts_cache,
+            az_key=az_key,
+            az_region=az_region,
         )
         chunk_audio = announcement + chunk_body
         chunk_audio.export(str(chunk_path), format="mp3", bitrate="192k")
