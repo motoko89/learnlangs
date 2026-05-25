@@ -67,6 +67,7 @@ INTRA_GROUP_BREAK_MS = 500
 INTER_PART_BREAK_MS = 1000
 INTER_CHUNK_BREAK_MS = 2000
 CHUNK_ANNOUNCEMENT_PAD_MS = 600
+NO_VOCAB_BREAK_MS = 600
 CHUNK_TARGET_MS = 5 * 60 * 1000
 SILENCE_LEN_MS = 500
 SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
@@ -661,6 +662,29 @@ def build_explanation_clip(
     return clip_a + gap + original_slice + gap + clip_b
 
 
+def build_no_vocab_clip(
+    sentence: Sentence,
+    sentence_translation: str,
+    original_audio: AudioSegment,
+    tts_cache: Path,
+    az_key: str,
+    az_region: str,
+) -> AudioSegment:
+    """Per-sentence clip for sentences without any new vocab:
+    original_slice + 600 + EN_TTS + 600 + ZH_TTS + 600 (trailing pause)."""
+    original_slice = original_audio[sentence.start_ms : sentence.end_ms]
+    en_clip = render_tts(
+        _wrap_ssml(_voice(EN_VOICE, sentence_translation or "(no translation)")),
+        tts_cache, az_key, az_region,
+    )
+    zh_clip = render_tts(
+        _wrap_ssml(_voice(TW_VOICE, sentence.text)),
+        tts_cache, az_key, az_region,
+    )
+    gap = AudioSegment.silent(duration=NO_VOCAB_BREAK_MS)
+    return original_slice + gap + en_clip + gap + zh_clip + gap
+
+
 # ─── Chunk assembly ───────────────────────────────────────────────────────────
 
 def assemble_chunk(
@@ -668,12 +692,15 @@ def assemble_chunk(
     total_chunks: int,
     original_audio: AudioSegment,
     explanations_by_sentence: dict[int, AudioSegment],
+    sentence_translations: dict[str, str],
     sentence_index: dict[int, int],
     tts_cache: Path,
     az_key: str,
     az_region: str,
 ) -> AudioSegment:
-    """Build: original_chunk + 1s + 600ms + announcement + 600ms + (part + expl + 1s)* + tail."""
+    """Build: original_chunk + 1s + 600ms + announcement + 600ms +
+    per-sentence playbacks (explanation clip for new-vocab sentences,
+    no-vocab clip otherwise) — pauses after every sentence."""
     out = original_audio[chunk.start_ms : chunk.end_ms]
     out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
     announcement = render_tts(
@@ -683,15 +710,20 @@ def assemble_chunk(
     pad = AudioSegment.silent(duration=CHUNK_ANNOUNCEMENT_PAD_MS)
     out += pad + announcement + pad
 
-    cursor = chunk.start_ms
-    new_word_sentences = [s for s in chunk.sentences if sentence_index[id(s)] in explanations_by_sentence]
-    for s in new_word_sentences:
-        out += original_audio[cursor : s.end_ms]
-        out += explanations_by_sentence[sentence_index[id(s)]]
-        out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
-        cursor = s.end_ms
-    if cursor < chunk.end_ms:
-        out += original_audio[cursor : chunk.end_ms]
+    for s in chunk.sentences:
+        idx = sentence_index[id(s)]
+        if idx in explanations_by_sentence:
+            out += explanations_by_sentence[idx]
+            out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
+        else:
+            out += build_no_vocab_clip(
+                sentence=s,
+                sentence_translation=sentence_translations.get(s.text, ""),
+                original_audio=original_audio,
+                tts_cache=tts_cache,
+                az_key=az_key,
+                az_region=az_region,
+            )
     return out
 
 
@@ -887,9 +919,10 @@ def main():
         print("None of the picked words appear in sentence-level tokens; aborting.")
         sys.exit(0)
 
-    nw_sentence_texts = [sentences[idx].text for idx in sentence_new_words]
+    all_sentence_texts = list({s.text for s in sentences})
+    print(f"  → translating {len(all_sentence_texts)} sentence(s)")
     try:
-        sentence_translations_raw = translate_batch(nw_sentence_texts, project_id, batch_size=50)
+        sentence_translations_raw = translate_batch(all_sentence_texts, project_id, batch_size=50)
     except Exception as e:
         print(f"  (sentence translate failed: {e})", file=sys.stderr)
         sentence_translations_raw = {}
@@ -945,6 +978,7 @@ def main():
             total_chunks=total_chunks,
             original_audio=original_audio,
             explanations_by_sentence=explanations,
+            sentence_translations=sentence_translations_raw,
             sentence_index=sentence_index,
             tts_cache=tts_cache,
             az_key=az_key,
