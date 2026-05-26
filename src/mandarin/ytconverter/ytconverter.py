@@ -73,8 +73,10 @@ SILENCE_LEN_MS = 500
 SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
 SILENCE_SEARCH_WINDOW_MS = 60 * 1000
 
-SENTENCE_BREAK_CHARS = "。！？!?.，,、；;：:"
+SENTENCE_END_CHARS = "。！？!?."
+SUB_SENTENCE_BREAK_CHARS = "，,、；;：:"
 MIN_SENTENCE_MS = 3000
+MAX_SENTENCE_MS = 8000
 PROPER_NOUN_POS = {"nr", "ns", "nt", "nz", "nrfg", "nrt"}
 SKIP_POS = {"u", "uj", "ul", "ud", "uv", "uz", "ug", "p", "c", "y", "e", "o", "x", "w", "m"}
 PUNCT_OR_DIGIT_RE = re.compile(r"^[\W\d_]+$", re.UNICODE)
@@ -320,22 +322,82 @@ def _sentence_from_words(buf: list[WordRec]) -> Sentence:
     )
 
 
+def _split_long_sentence(s: Sentence) -> list[Sentence]:
+    """Break a sentence longer than MAX_SENTENCE_MS into roughly equal pieces.
+    Splits at SUB_SENTENCE_BREAK_CHARS when there are enough of them; falls
+    back to between-word positions to fill any remaining splits."""
+    length = s.end_ms - s.start_ms
+    if length <= MAX_SENTENCE_MS:
+        return [s]
+    n_words = len(s.words)
+    if n_words < 2:
+        return [s]
+    n_subs = (length + MAX_SENTENCE_MS - 1) // MAX_SENTENCE_MS
+    n_splits = min(n_subs - 1, n_words - 1)
+
+    sub_breaks = [
+        i for i in range(n_words - 1)
+        if s.words[i].word and s.words[i].word[-1] in SUB_SENTENCE_BREAK_CHARS
+    ]
+    candidates = sub_breaks if len(sub_breaks) >= n_splits else list(range(n_words - 1))
+
+    chosen: list[int] = []
+    remaining = list(candidates)
+    for k in range(n_splits):
+        if not remaining:
+            break
+        ideal = s.start_ms + (k + 1) * length / n_subs
+        best = min(remaining, key=lambda i: abs(s.words[i].end_ms - ideal))
+        chosen.append(best)
+        remaining = [r for r in remaining if r > best]
+
+    chosen.sort()
+    pieces: list[Sentence] = []
+    last = 0
+    for ci in chosen:
+        pieces.append(_sentence_from_words(s.words[last : ci + 1]))
+        last = ci + 1
+    pieces.append(_sentence_from_words(s.words[last:]))
+    return pieces
+
+
 def build_sentences(words: list[WordRec]) -> list[Sentence]:
-    """Group word records into sentences at break punctuation. A break is only
-    taken once the buffer has reached MIN_SENTENCE_MS; shorter pieces accrue
-    into the next one."""
-    sentences: list[Sentence] = []
+    """Three-pass segmentation:
+    1) Split at SENTENCE_END_CHARS.
+    2) Sentences shorter than MIN_SENTENCE_MS are merged into the next one
+       (or, if the tail is short, into the previous one).
+    3) Sentences longer than MAX_SENTENCE_MS are subdivided into
+       ceil(length / MAX_SENTENCE_MS) roughly equal pieces."""
+    raw: list[list[WordRec]] = []
     buf: list[WordRec] = []
     for w in words:
         buf.append(w)
-        duration = buf[-1].end_ms - buf[0].start_ms
-        is_break = bool(w.word) and w.word[-1] in SENTENCE_BREAK_CHARS
-        if is_break and duration >= MIN_SENTENCE_MS:
-            sentences.append(_sentence_from_words(buf))
+        if w.word and w.word[-1] in SENTENCE_END_CHARS:
+            raw.append(buf)
             buf = []
     if buf:
-        sentences.append(_sentence_from_words(buf))
-    return sentences
+        raw.append(buf)
+
+    merged: list[list[WordRec]] = []
+    carry: list[WordRec] = []
+    for piece in raw:
+        combined = carry + piece
+        duration = combined[-1].end_ms - combined[0].start_ms
+        if duration < MIN_SENTENCE_MS:
+            carry = combined
+        else:
+            merged.append(combined)
+            carry = []
+    if carry:
+        if merged:
+            merged[-1] = merged[-1] + carry
+        else:
+            merged.append(carry)
+
+    out: list[Sentence] = []
+    for piece in merged:
+        out.extend(_split_long_sentence(_sentence_from_words(piece)))
+    return out
 
 
 def sentences_to_jsonable(sentences: list[Sentence]) -> list[dict]:
