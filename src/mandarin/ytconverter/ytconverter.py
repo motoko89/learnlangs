@@ -74,8 +74,7 @@ SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
 SILENCE_SEARCH_WINDOW_MS = 60 * 1000
 
 SENTENCE_BREAK_CHARS = "。！？!?.，,、；;：:"
-MIN_SENTENCE_MS = 2000
-MAX_SENTENCE_MS = 7000
+MIN_SENTENCE_MS = 3000
 PROPER_NOUN_POS = {"nr", "ns", "nt", "nz", "nrfg", "nrt"}
 SKIP_POS = {"u", "uj", "ul", "ud", "uv", "uz", "ug", "p", "c", "y", "e", "o", "x", "w", "m"}
 PUNCT_OR_DIGIT_RE = re.compile(r"^[\W\d_]+$", re.UNICODE)
@@ -322,17 +321,16 @@ def _sentence_from_words(buf: list[WordRec]) -> Sentence:
 
 
 def build_sentences(words: list[WordRec]) -> list[Sentence]:
-    """Group word records into sentences at break punctuation, keeping each
-    sentence between MIN_SENTENCE_MS and MAX_SENTENCE_MS. A break char is only
-    taken once the buffer has reached MIN_SENTENCE_MS; once it exceeds
-    MAX_SENTENCE_MS, the buffer is flushed at the next word regardless."""
+    """Group word records into sentences at break punctuation. A break is only
+    taken once the buffer has reached MIN_SENTENCE_MS; shorter pieces accrue
+    into the next one."""
     sentences: list[Sentence] = []
     buf: list[WordRec] = []
     for w in words:
         buf.append(w)
         duration = buf[-1].end_ms - buf[0].start_ms
         is_break = bool(w.word) and w.word[-1] in SENTENCE_BREAK_CHARS
-        if (is_break and duration >= MIN_SENTENCE_MS) or duration >= MAX_SENTENCE_MS:
+        if is_break and duration >= MIN_SENTENCE_MS:
             sentences.append(_sentence_from_words(buf))
             buf = []
     if buf:
