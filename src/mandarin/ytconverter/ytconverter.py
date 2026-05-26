@@ -73,9 +73,9 @@ SILENCE_LEN_MS = 500
 SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
 SILENCE_SEARCH_WINDOW_MS = 60 * 1000
 
-SENTENCE_END_CHARS = "。！？!?."
-SUB_SENTENCE_BREAK_CHARS = "，,、；;：:"
-MAX_SENTENCE_MS = 5000
+SENTENCE_BREAK_CHARS = "。！？!?.，,、；;：:"
+MIN_SENTENCE_MS = 2000
+MAX_SENTENCE_MS = 7000
 PROPER_NOUN_POS = {"nr", "ns", "nt", "nz", "nrfg", "nrt"}
 SKIP_POS = {"u", "uj", "ul", "ud", "uv", "uz", "ug", "p", "c", "y", "e", "o", "x", "w", "m"}
 PUNCT_OR_DIGIT_RE = re.compile(r"^[\W\d_]+$", re.UNICODE)
@@ -312,32 +312,6 @@ class Sentence:
     words: list[WordRec] = field(default_factory=list)
 
 
-def build_sentences(words: list[WordRec]) -> list[Sentence]:
-    """Group word records into sentences by trailing punctuation."""
-    sentences: list[Sentence] = []
-    buf: list[WordRec] = []
-    for w in words:
-        buf.append(w)
-        if w.word and w.word[-1] in SENTENCE_END_CHARS:
-            text = "".join(x.word for x in buf).strip()
-            sentences.append(Sentence(
-                text=text,
-                start_ms=buf[0].start_ms,
-                end_ms=buf[-1].end_ms,
-                words=buf,
-            ))
-            buf = []
-    if buf:
-        text = "".join(x.word for x in buf).strip()
-        sentences.append(Sentence(
-            text=text,
-            start_ms=buf[0].start_ms,
-            end_ms=buf[-1].end_ms,
-            words=buf,
-        ))
-    return sentences
-
-
 def _sentence_from_words(buf: list[WordRec]) -> Sentence:
     return Sentence(
         text="".join(x.word for x in buf).strip(),
@@ -347,24 +321,23 @@ def _sentence_from_words(buf: list[WordRec]) -> Sentence:
     )
 
 
-def split_long_sentences(sentences: list[Sentence], max_ms: int) -> list[Sentence]:
-    """Split sentences longer than max_ms at secondary punctuation marks."""
-    out: list[Sentence] = []
-    for s in sentences:
-        if s.end_ms - s.start_ms <= max_ms:
-            out.append(s)
-            continue
-        pieces: list[Sentence] = []
-        buf: list[WordRec] = []
-        for w in s.words:
-            buf.append(w)
-            if w.word and w.word[-1] in SUB_SENTENCE_BREAK_CHARS:
-                pieces.append(_sentence_from_words(buf))
-                buf = []
-        if buf:
-            pieces.append(_sentence_from_words(buf))
-        out.extend(pieces if len(pieces) > 1 else [s])
-    return out
+def build_sentences(words: list[WordRec]) -> list[Sentence]:
+    """Group word records into sentences at break punctuation, keeping each
+    sentence between MIN_SENTENCE_MS and MAX_SENTENCE_MS. A break char is only
+    taken once the buffer has reached MIN_SENTENCE_MS; once it exceeds
+    MAX_SENTENCE_MS, the buffer is flushed at the next word regardless."""
+    sentences: list[Sentence] = []
+    buf: list[WordRec] = []
+    for w in words:
+        buf.append(w)
+        duration = buf[-1].end_ms - buf[0].start_ms
+        is_break = bool(w.word) and w.word[-1] in SENTENCE_BREAK_CHARS
+        if (is_break and duration >= MIN_SENTENCE_MS) or duration >= MAX_SENTENCE_MS:
+            sentences.append(_sentence_from_words(buf))
+            buf = []
+    if buf:
+        sentences.append(_sentence_from_words(buf))
+    return sentences
 
 
 def sentences_to_jsonable(sentences: list[Sentence]) -> list[dict]:
@@ -855,11 +828,6 @@ def main():
     if not sentences:
         print("Empty transcript; aborting.", file=sys.stderr)
         sys.exit(1)
-
-    before = len(sentences)
-    sentences = split_long_sentences(sentences, MAX_SENTENCE_MS)
-    if len(sentences) != before:
-        print(f"  → split long sentences: {before} → {len(sentences)} (>{MAX_SENTENCE_MS}ms broken on '{SUB_SENTENCE_BREAK_CHARS}')")
 
     transcript_text = "".join(s.text for s in sentences)
 
