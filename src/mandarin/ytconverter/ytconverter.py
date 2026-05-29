@@ -769,6 +769,7 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket for STT staging (else read from key.json:gcsBucket)")
     parser.add_argument("--azure-region", help="Azure Speech region (else read from key.json:azSpeechRegion)")
     parser.add_argument("--chunk-minutes", type=float, default=5.0)
+    parser.add_argument("--speakers", type=int, default=2, help="Number of speakers for diarization (default: 2)")
     args = parser.parse_args()
 
     ensure_hsk_file(HSK_PATH)
@@ -840,12 +841,7 @@ def main():
             except (json.JSONDecodeError, ValueError, TypeError):
                 boundaries = None
     else:
-        try:
-            speaker_count = int(input("How many speakers in the audio? ").strip() or "2")
-        except ValueError:
-            speaker_count = 2
-        if speaker_count < 1:
-            speaker_count = 1
+        speaker_count = max(1, args.speakers)
         print(f"  → diarization: {speaker_count} speaker(s)")
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
