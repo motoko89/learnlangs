@@ -68,7 +68,6 @@ INTER_PART_BREAK_MS = 1000
 INTER_CHUNK_BREAK_MS = 2000
 CHUNK_ANNOUNCEMENT_PAD_MS = 600
 NO_VOCAB_BREAK_MS = 600
-CHUNK_TARGET_MS = 5 * 60 * 1000
 SILENCE_LEN_MS = 500
 SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
 SILENCE_SEARCH_WINDOW_MS = 60 * 1000
@@ -569,7 +568,7 @@ def chunk_sentences_by_boundaries(
     return chunks
 
 
-def chunk_sentences(sentences: list[Sentence], target_ms: int = CHUNK_TARGET_MS) -> list[Chunk]:
+def chunk_sentences(sentences: list[Sentence], target_ms: int) -> list[Chunk]:
     chunks: list[Chunk] = []
     current: list[Sentence] = []
     start_ms = sentences[0].start_ms if sentences else 0
@@ -688,7 +687,7 @@ def build_explanation_clip(
     clip_a = render_tts(ssml_words_and_meanings(pairs), tts_cache, az_key, az_region)
     original_slice = original_audio[sentence.start_ms : sentence.end_ms]
     clip_b = render_tts(
-        ssml_sentence_pair(sentence.text, sentence_translation),
+        ssml_sentence_pair(sentence_translation, sentence.text),
         tts_cache, az_key, az_region,
     )
     gap = AudioSegment.silent(duration=INTRA_GROUP_BREAK_MS)
