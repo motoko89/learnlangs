@@ -649,10 +649,10 @@ def ssml_words_and_meanings(pairs: list[tuple[str, str]]) -> str:
     return _wrap_ssml("".join(parts))
 
 
-def ssml_sentence_pair(zh_text: str, en_text: str) -> str:
+def ssml_sentence_pair(en_text: str, zh_text: str) -> str:
     body = (
-        _voice(TW_VOICE, zh_text, trail_break_ms=INTRA_GROUP_BREAK_MS)
-        + _voice(EN_VOICE, en_text or "(no translation)")
+        _voice(EN_VOICE, en_text or "(no translation)", trail_break_ms=INTRA_GROUP_BREAK_MS)
+        + _voice(TW_VOICE, zh_text)
     )
     return _wrap_ssml(body)
 
