@@ -49,6 +49,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -224,7 +225,12 @@ def _duration_to_ms(d) -> int:
     return int(d.seconds * 1000 + d.nanos // 1_000_000)
 
 
-def transcribe(files: list[tuple[str, int]], project_id: str, speaker_count: int) -> list[WordRec]:
+def transcribe(
+    files: list[tuple[str, int]],
+    project_id: str,
+    min_speaker_count: int,
+    max_speaker_count: int,
+) -> list[WordRec]:
     """Chirp v2 BatchRecognize across N files. files = [(gcs_uri, offset_ms), ...].
     Returns flat list of word records (Hans), timestamps already offset and sorted."""
     from google.api_core.client_options import ClientOptions
@@ -243,8 +249,8 @@ def transcribe(files: list[tuple[str, int]], project_id: str, speaker_count: int
             enable_automatic_punctuation=True,
             enable_word_time_offsets=True,
             diarization_config=cloud_speech.SpeakerDiarizationConfig(
-                min_speaker_count=speaker_count,
-                max_speaker_count=speaker_count,
+                min_speaker_count=min_speaker_count,
+                max_speaker_count=max_speaker_count,
             ),
         ),
     )
@@ -602,21 +608,28 @@ def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> Audio
     if not out_path.exists():
         import azure.cognitiveservices.speech as speechsdk
 
-        speech_config = speechsdk.SpeechConfig(subscription=az_key, region=az_region)
-        speech_config.set_speech_synthesis_output_format(
-            speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3
-        )
-        audio_config = speechsdk.audio.AudioOutputConfig(filename=str(out_path))
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
-        result = synthesizer.speak_ssml_async(ssml).get()
-        if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-            details = getattr(result, "cancellation_details", None)
-            err = details.error_details if details else "unknown"
+        # Atomic write so concurrent renders of the same SSML never read a partial file.
+        fd, tmp_str = tempfile.mkstemp(suffix=".mp3", prefix=f".{sha}.", dir=str(cache_dir))
+        os.close(fd)
+        tmp_path = Path(tmp_str)
+        try:
+            speech_config = speechsdk.SpeechConfig(subscription=az_key, region=az_region)
+            speech_config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3
+            )
+            audio_config = speechsdk.audio.AudioOutputConfig(filename=str(tmp_path))
+            synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+            result = synthesizer.speak_ssml_async(ssml).get()
+            if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+                details = getattr(result, "cancellation_details", None)
+                err = details.error_details if details else "unknown"
+                raise RuntimeError(f"Azure TTS failed: {result.reason} / {err}")
+            os.replace(tmp_path, out_path)
+        finally:
             try:
-                out_path.unlink()
+                tmp_path.unlink()
             except FileNotFoundError:
                 pass
-            raise RuntimeError(f"Azure TTS failed: {result.reason} / {err}")
     return AudioSegment.from_mp3(str(out_path))
 
 
@@ -769,7 +782,9 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket for STT staging (else read from key.json:gcsBucket)")
     parser.add_argument("--azure-region", help="Azure Speech region (else read from key.json:azSpeechRegion)")
     parser.add_argument("--chunk-minutes", type=float, default=5.0)
-    parser.add_argument("--speakers", type=int, default=2, help="Number of speakers for diarization (default: 2)")
+    parser.add_argument("--min-speakers", type=int, default=2, help="Minimum number of speakers for diarization (default: 2, min 1)")
+    parser.add_argument("--max-speakers", type=int, default=None, help="Maximum number of speakers for diarization (default: same as --min-speakers; clamped to >= min)")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel chunk-build workers (default: 4)")
     args = parser.parse_args()
 
     ensure_hsk_file(HSK_PATH)
@@ -841,8 +856,10 @@ def main():
             except (json.JSONDecodeError, ValueError, TypeError):
                 boundaries = None
     else:
-        speaker_count = max(1, args.speakers)
-        print(f"  → diarization: {speaker_count} speaker(s)")
+        min_speakers = max(1, args.min_speakers)
+        max_speakers = args.max_speakers if args.max_speakers is not None else min_speakers
+        max_speakers = max(min_speakers, max_speakers)
+        print(f"  → diarization: {min_speakers}-{max_speakers} speaker(s)")
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             print(f"  → MP3 → FLAC chunks ({TARGET_SAMPLE_RATE}Hz mono, ~{chunk_target_ms // 60000}min each, split at silence)")
@@ -857,7 +874,9 @@ def main():
                 gcs_uri, blob = upload_to_gcs(chunk_path, gcs_bucket, blob_name)
                 uploaded.append((gcs_uri, offset_ms, blob))
             try:
-                hans_words = transcribe([(u, o) for u, o, _ in uploaded], project_id, speaker_count)
+                hans_words = transcribe(
+                    [(u, o) for u, o, _ in uploaded], project_id, min_speakers, max_speakers
+                )
             finally:
                 for _, _, blob in uploaded:
                     try:
@@ -988,10 +1007,9 @@ def main():
         if n % 5 == 0 or n == len(sentence_new_words):
             print(f"  expl [{n}/{len(sentence_new_words)}]")
 
-    final = AudioSegment.silent(duration=0)
     total_chunks = len(chunks)
-    for c in chunks:
-        chunk_path = chunks_cache / f"chunk_{c.idx:02d}.mp3"
+
+    def _build_one_chunk(c: Chunk) -> tuple[int, AudioSegment]:
         announcement = render_tts(
             ssml_part_announcement(c.idx, total_chunks),
             tts_cache, az_key, az_region,
@@ -1008,10 +1026,24 @@ def main():
             az_region=az_region,
         )
         chunk_audio = announcement + chunk_body
+        chunk_path = chunks_cache / f"chunk_{c.idx:02d}.mp3"
         chunk_audio.export(str(chunk_path), format="mp3", bitrate="192k")
-        print(f"  → {chunk_path.name} ({len(chunk_audio) / 1000:.1f}s)")
-        final += chunk_audio
-        if c.idx != len(chunks):
+        return c.idx, chunk_audio
+
+    workers = max(1, min(args.workers, total_chunks))
+    print(f"  → building {total_chunks} chunk(s) with {workers} worker(s)")
+    built: dict[int, AudioSegment] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_build_one_chunk, c) for c in chunks]
+        for n, future in enumerate(as_completed(futures), 1):
+            idx, chunk_audio = future.result()
+            built[idx] = chunk_audio
+            print(f"  → chunk_{idx:02d}.mp3 ({len(chunk_audio) / 1000:.1f}s) [{n}/{total_chunks}]")
+
+    final = AudioSegment.silent(duration=0)
+    for i, c in enumerate(chunks):
+        final += built[c.idx]
+        if i != len(chunks) - 1:
             final += AudioSegment.silent(duration=INTER_CHUNK_BREAK_MS)
 
     final_path = outputs_dir / f"{stem}.mp3"
