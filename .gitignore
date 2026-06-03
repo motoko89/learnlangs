@@ -63,3 +63,4 @@ intermediates/
 outputs/
 .DS_Store
 __pycache__/
+learntwords.txt
