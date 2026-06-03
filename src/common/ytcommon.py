@@ -668,7 +668,7 @@ def build_explanation_clip(
         tts_cache, az_key, az_region,
     )
     gap = AudioSegment.silent(duration=INTRA_GROUP_BREAK_MS)
-    return clip_a + gap + original_slice + gap + clip_b
+    return clip_a + gap + original_slice + gap + clip_b + gap + original_slice
 
 
 def build_no_vocab_clip(
@@ -692,7 +692,7 @@ def build_no_vocab_clip(
         tts_cache, az_key, az_region,
     )
     gap = AudioSegment.silent(duration=NO_VOCAB_BREAK_MS)
-    return original_slice + gap + en_clip + gap + native_clip + gap
+    return original_slice + gap + en_clip + gap + native_clip + gap + original_slice + gap
 
 
 # ─── Chunk assembly ───────────────────────────────────────────────────────────
