@@ -629,6 +629,10 @@ def ssml_sentence_pair(en_text: str, native_text: str, cfg: LangConfig) -> str:
 
 
 def ssml_chunk_announcement(idx: int, total: int, cfg: LangConfig) -> str:
+    return _wrap_ssml(_voice(cfg.en_voice, f"Explaining part {idx} of {total}.", cfg.tts_rate), cfg.xml_lang)
+
+
+def ssml_replay_announcement(idx: int, total: int, cfg: LangConfig) -> str:
     return _wrap_ssml(_voice(cfg.en_voice, f"Playback part {idx} of {total}.", cfg.tts_rate), cfg.xml_lang)
 
 
@@ -707,8 +711,10 @@ def assemble_chunk(
 ) -> AudioSegment:
     """Build: original_chunk + 1s + 600ms + announcement + 600ms +
     per-sentence playbacks (explanation clip for new-vocab sentences,
-    no-vocab clip otherwise) — pauses after every sentence."""
-    out = original_audio[chunk.start_ms : chunk.end_ms]
+    no-vocab clip otherwise) — pauses after every sentence — then a
+    "Playback part X of Y" announcement and a replay of the original chunk."""
+    original_slice = original_audio[chunk.start_ms : chunk.end_ms]
+    out = original_slice
     out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
     announcement = render_tts(
         ssml_chunk_announcement(chunk.idx, total_chunks, cfg),
@@ -732,4 +738,12 @@ def assemble_chunk(
                 az_region=az_region,
                 cfg=cfg,
             )
+
+    # After the explanations, announce and replay the whole original chunk.
+    replay_announcement = render_tts(
+        ssml_replay_announcement(chunk.idx, total_chunks, cfg),
+        tts_cache, az_key, az_region,
+    )
+    out += pad + replay_announcement + pad
+    out += original_slice
     return out
