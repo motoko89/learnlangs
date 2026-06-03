@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Mandarin YouTube → Vocab Listening-Practice Generator.
+"""French YouTube → Vocab Listening-Practice Generator.
 
 End-to-end pipeline:
   1. Prompt for a YouTube URL.
   2. Download audio (yt-dlp -x mp3) into ./inputs/.
-  3. Transcribe with Google Chirp (chirp_3, cmn-Hans-CN), with word-level
-     timestamps. Convert Hans → Hant-TW via OpenCC. Cache JSON.
-  4. Tokenize with jieba and count occurrences.
+  3. Transcribe with Google Chirp (chirp_3, fr-FR), with word-level timestamps.
+     Cache JSON.
+  4. Tokenize/lemmatize with spaCy (fr_core_news_sm) and count occurrences.
   5. Interactively pick X most-occurring + X least-occurring NEW words
-     (single keypress: 1 = NEW, 2 = mark KNOWN/append to hsk1to4_zh-TW.txt).
+     (single keypress: 1 = NEW, 2 = mark KNOWN/append to learntwords.txt).
   6. Slice the source audio into ~10-min chunks snapped to sentence ends.
   7. For each sentence containing ≥1 new word, render an Azure TTS explanation
      clip = word(s) + English meaning(s) + original sentence slice + synthetic
@@ -18,8 +18,8 @@ End-to-end pipeline:
      and concatenate all chunks (2s between chunks) into outputs/<stem>.mp3.
 
 Language-agnostic pipeline code lives in src/common/ytcommon.py; this script
-only carries the Mandarin-specific pieces (jieba tokenizer, OpenCC s2tw,
-Azure pinyin transliteration, the HSK known-words list, and the voices).
+only carries the French-specific pieces (spaCy tokenizer/lemmatizer, the
+learnt-words list, and the voices).
 
 I/O folders (created at invocation cwd):
   inputs/                 - downloaded MP3
@@ -34,6 +34,7 @@ Credentials (next to this script):
 
 Dependencies:
   pip install -r requirements.txt
+  python -m spacy download fr_core_news_sm
   brew install ffmpeg   # pydub MP3 decode; also used by yt-dlp
   python3 ytconverter.py
 """
@@ -85,83 +86,57 @@ from common.ytcommon import (  # noqa: E402
     upload_to_gcs,
 )
 
-PROPER_NOUN_POS = {"nr", "ns", "nt", "nz", "nrfg", "nrt"}
-SKIP_POS = {"u", "uj", "ul", "ud", "uv", "uz", "ug", "p", "c", "y", "e", "o", "x", "w", "m"}
-PUNCT_OR_DIGIT_RE = re.compile(r"^[\W\d_]+$", re.UNICODE)
-HAN_ONLY_RE = re.compile(r"^[㐀-䶿一-鿿豈-﫿]+$")
+# spaCy Universal POS tags to drop: function words, punctuation, numbers, etc.
+SKIP_POS = {"DET", "ADP", "CCONJ", "SCONJ", "PRON", "AUX", "PART", "PUNCT", "NUM", "SYM", "X", "SPACE", "INTJ"}
+# Vocab-picker filter: a French word (lowercase, accents, internal apostrophe/hyphen).
+FRENCH_WORD_RE = re.compile(r"^[a-zà-öø-ÿœæ][a-zà-öø-ÿœæ'’\-]*$")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-HSK_PATH = SCRIPT_DIR / "hsk1to4_zh-TW.txt"
-HSK_HEADER = (
-    "# HSK 1-4 vocabulary list — traditional Chinese characters\n"
+KNOWN_PATH = SCRIPT_DIR / "learntwords.txt"
+KNOWN_HEADER = (
+    "# Learnt French words — one base form (lemma) per line.\n"
     "# Words NOT in this list are flagged as candidates by ytconverter.py.\n"
-    "# Add one traditional word per line; lines starting with '#' are ignored.\n\n"
+    "# Add one word per line; lines starting with '#' are ignored.\n\n"
 )
 
-MANDARIN = LangConfig(
-    native_voice="zh-TW-YunJheNeural",
+FRENCH = LangConfig(
+    native_voice="fr-FR-DeniseNeural",
     en_voice="en-US-AvaNeural",
     tts_rate="0.9",
-    xml_lang="zh-TW",
-    language_code="cmn-Hans-CN",
+    xml_lang="fr-FR",
+    language_code="fr-FR",
     chirp_location="us",
     chirp_model="chirp_3",
-    sentence_end_chars="。！？!?.",
-    sub_sentence_break_chars="，,、；;：:",
-    word_joiner="",
-    translate_source="zh-TW",
+    sentence_end_chars=".!?…",
+    sub_sentence_break_chars=",;:",
+    word_joiner=" ",
+    translate_source="fr",
 )
 
 
-# ─── Mandarin tokenization (jieba) ────────────────────────────────────────────
+# ─── French tokenization (spaCy lemmatizer) ───────────────────────────────────
+
+_NLP = None
+
 
 def tokenize(text: str) -> list[tuple[str, str]]:
-    import jieba.posseg as pseg
+    """Return [(lemma, pos), ...] keeping content words only. Lemmatizing means
+    conjugations/inflections collapse to their base form (mange/mangé/mangeons
+    → manger; belle/beaux → beau)."""
+    global _NLP
+    if _NLP is None:
+        import spacy
+        _NLP = spacy.load("fr_core_news_sm", disable=["parser", "ner"])
 
     out: list[tuple[str, str]] = []
-    for w, pos in pseg.cut(text, HMM=True):
-        w = w.strip()
-        if not w or PUNCT_OR_DIGIT_RE.match(w):
+    for t in _NLP(text):
+        lemma = t.lemma_.lower().strip()
+        if not lemma or t.pos_ in SKIP_POS:
             continue
-        if pos in SKIP_POS:
+        if len(lemma) < 2 or not FRENCH_WORD_RE.match(lemma):
             continue
-        if len(w) < 2 and pos not in PROPER_NOUN_POS:
-            continue
-        out.append((w, pos))
+        out.append((lemma, t.pos_))
     return out
-
-
-# ─── OpenCC s2tw (Simplified → Traditional Taiwan) ────────────────────────────
-
-_S2T_CONVERTER = None
-
-
-def s2t(text: str) -> str:
-    global _S2T_CONVERTER
-    if _S2T_CONVERTER is None:
-        from opencc import OpenCC
-        _S2T_CONVERTER = OpenCC("s2tw")
-    return _S2T_CONVERTER.convert(text)
-
-
-# ─── Azure pinyin transliteration ─────────────────────────────────────────────
-
-def transliterate(text: str, az_key: str, az_region: str | None = None) -> str:
-    import requests
-
-    url = (
-        "https://api.cognitive.microsofttranslator.com/transliterate"
-        "?api-version=3.0&language=zh-Hant&fromScript=Hant&toScript=Latn"
-    )
-    headers = {"Ocp-Apim-Subscription-Key": az_key, "Content-Type": "application/json"}
-    if az_region:
-        headers["Ocp-Apim-Subscription-Region"] = az_region
-    resp = requests.post(url, headers=headers, json=[{"Text": text}], timeout=30)
-    resp.raise_for_status()
-    result = resp.json()
-    if result and "text" in result[0]:
-        return result[0]["text"]
-    return ""
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -179,7 +154,7 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="Parallel chunk-build workers (default: 4)")
     args = parser.parse_args()
 
-    ensure_known_file(HSK_PATH, HSK_HEADER)
+    ensure_known_file(KNOWN_PATH, KNOWN_HEADER)
 
     cwd = Path.cwd()
     inputs_dir = cwd / "inputs"
@@ -266,12 +241,12 @@ def main():
                 gcs_uri, blob = upload_to_gcs(chunk_path, gcs_bucket, blob_name)
                 uploaded.append((gcs_uri, offset_ms, blob))
             try:
-                hans_words = transcribe(
+                fr_words = transcribe(
                     [(u, o) for u, o, _ in uploaded],
                     project_id,
-                    MANDARIN.chirp_location,
-                    MANDARIN.chirp_model,
-                    MANDARIN.language_code,
+                    FRENCH.chirp_location,
+                    FRENCH.chirp_model,
+                    FRENCH.language_code,
                     min_speakers,
                     max_speakers,
                 )
@@ -281,9 +256,8 @@ def main():
                         blob.delete()
                     except Exception as e:
                         print(f"  (warning: failed to delete staged blob: {e})", file=sys.stderr)
-        print(f"  → {len(hans_words)} word records; OpenCC s2tw")
-        tw_words = [WordRec(word=s2t(w.word), start_ms=w.start_ms, end_ms=w.end_ms) for w in hans_words]
-        sentences = build_sentences(tw_words, MANDARIN)
+        print(f"  → {len(fr_words)} word records")
+        sentences = build_sentences(fr_words, FRENCH)
         if sentences:
             transcript_json_path.write_text(
                 json.dumps(sentences_to_jsonable(sentences), ensure_ascii=False, indent=2),
@@ -301,7 +275,7 @@ def main():
         print("Empty transcript; aborting.", file=sys.stderr)
         sys.exit(1)
 
-    transcript_text = "".join(s.text for s in sentences)
+    transcript_text = " ".join(s.text for s in sentences)
 
     # ── 3. Tokenize + count ─────────────────────────────────────────────────
     print("\n[3/7] tokenize")
@@ -315,33 +289,23 @@ def main():
         x = int(input("How many new words per round (X): ").strip() or "10")
     except ValueError:
         x = 10
-    known = load_known_words(HSK_PATH)
-    picked_most = pick_round("MOST occurring", counts, known, x, False, HAN_ONLY_RE, HSK_PATH)
-    picked_least = pick_round("LEAST occurring", counts, known, x, True, HAN_ONLY_RE, HSK_PATH)
+    known = load_known_words(KNOWN_PATH)
+    picked_most = pick_round("MOST occurring", counts, known, x, False, FRENCH_WORD_RE, KNOWN_PATH)
+    picked_least = pick_round("LEAST occurring", counts, known, x, True, FRENCH_WORD_RE, KNOWN_PATH)
     new_words: dict[str, int] = {**picked_most, **picked_least}
     print(f"\n  → {len(new_words)} total new words")
     if not new_words:
         print("No new words picked; nothing to synthesize. Exiting.")
         sys.exit(0)
 
-    # ── 5. Enrich (pinyin + per-word + per-sentence translation) ────────────
-    print("\n[5/7] enrich (translate words + sentences, pinyin)")
+    # ── 5. Enrich (per-word + per-sentence translation) ─────────────────────
+    print("\n[5/7] enrich (translate words + sentences)")
     words_list = list(new_words.keys())
     try:
-        word_meanings = translate_batch(words_list, project_id, MANDARIN.translate_source)
+        word_meanings = translate_batch(words_list, project_id, FRENCH.translate_source)
     except Exception as e:
         print(f"  (word translate failed: {e})", file=sys.stderr)
         word_meanings = {w: "" for w in words_list}
-
-    pinyin_map: dict[str, str] = {}
-    for i, w in enumerate(words_list, 1):
-        try:
-            pinyin_map[w] = transliterate(w, az_key, az_region)
-        except Exception as e:
-            print(f"    pinyin failed for {w!r}: {e}", file=sys.stderr)
-            pinyin_map[w] = ""
-        if i % 25 == 0:
-            print(f"    pinyin [{i}/{len(words_list)}]")
 
     # Identify which sentences contain ≥1 new word (preserve order of new words in sentence)
     new_word_set = set(words_list)
@@ -363,7 +327,7 @@ def main():
     print(f"  → translating {len(all_sentence_texts)} sentence(s)")
     try:
         sentence_translations_raw = translate_batch(
-            all_sentence_texts, project_id, MANDARIN.translate_source, batch_size=50
+            all_sentence_texts, project_id, FRENCH.translate_source, batch_size=50
         )
     except Exception as e:
         print(f"  (sentence translate failed: {e})", file=sys.stderr)
@@ -371,9 +335,9 @@ def main():
 
     with open(vocab_tsv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter="\t", lineterminator="\n")
-        writer.writerow(["word", "pinyin", "english", "count"])
+        writer.writerow(["word", "english", "count"])
         for w in words_list:
-            writer.writerow([w, pinyin_map.get(w, ""), word_meanings.get(w, ""), new_words[w]])
+            writer.writerow([w, word_meanings.get(w, ""), new_words[w]])
     print(f"  → wrote {vocab_tsv_path.name}")
 
     # ── 6. Load source audio + chunk ────────────────────────────────────────
@@ -403,7 +367,7 @@ def main():
             tts_cache=tts_cache,
             az_key=az_key,
             az_region=az_region,
-            cfg=MANDARIN,
+            cfg=FRENCH,
         )
         if n % 5 == 0 or n == len(sentence_new_words):
             print(f"  expl [{n}/{len(sentence_new_words)}]")
@@ -412,7 +376,7 @@ def main():
 
     def _build_one_chunk(c: Chunk) -> tuple[int, AudioSegment]:
         announcement = render_tts(
-            ssml_part_announcement(c.idx, total_chunks, MANDARIN),
+            ssml_part_announcement(c.idx, total_chunks, FRENCH),
             tts_cache, az_key, az_region,
         )
         chunk_body = assemble_chunk(
@@ -425,7 +389,7 @@ def main():
             tts_cache=tts_cache,
             az_key=az_key,
             az_region=az_region,
-            cfg=MANDARIN,
+            cfg=FRENCH,
         )
         chunk_audio = announcement + chunk_body
         chunk_path = chunks_cache / f"chunk_{c.idx:02d}.mp3"
@@ -456,7 +420,7 @@ def main():
         tags={
             "title": stem,
             "artist": "LearnLangs Youtube Converter",
-            "album": "LearnLangs Mandarin",
+            "album": "LearnLangs French",
         },
     )
     print(f"\nDone! {len(final) / 1000:.1f}s → {final_path}")
