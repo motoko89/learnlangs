@@ -372,7 +372,6 @@ def main():
 
     with open(vocab_tsv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter="\t", lineterminator="\n")
-        writer.writerow(["word", "pinyin", "english", "count"])
         for w in words_list:
             writer.writerow([w, pinyin_map.get(w, ""), word_meanings.get(w, ""), new_words[w]])
     print(f"  → wrote {vocab_tsv_path.name}")
