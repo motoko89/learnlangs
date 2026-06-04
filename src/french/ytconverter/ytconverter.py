@@ -290,8 +290,9 @@ def main():
     except ValueError:
         x = 10
     known = load_known_words(KNOWN_PATH)
-    picked_most = pick_round("MOST occurring", counts, known, x, False, FRENCH_WORD_RE, KNOWN_PATH)
-    picked_least = pick_round("LEAST occurring", counts, known, x, True, FRENCH_WORD_RE, KNOWN_PATH)
+    prompted: set[str] = set()
+    picked_most = pick_round("MOST occurring", counts, known, x, False, FRENCH_WORD_RE, KNOWN_PATH, prompted)
+    picked_least = pick_round("LEAST occurring", counts, known, x, True, FRENCH_WORD_RE, KNOWN_PATH, prompted)
     new_words: dict[str, int] = {**picked_most, **picked_least}
     print(f"\n  → {len(new_words)} total new words")
     if not new_words:

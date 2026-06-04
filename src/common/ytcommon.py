@@ -438,10 +438,13 @@ def pick_round(
     least_first: bool,
     word_re: re.Pattern,
     known_path: Path,
+    prompted: set[str],
 ) -> dict[str, int]:
     """Iterate candidates and prompt single-keypress 1=NEW, 2=KNOWN, q=stop.
     Returns dict {word: count} for accepted-as-new words. Words answered KNOWN
-    are appended to known_path."""
+    are appended to known_path. Every word shown is recorded in `prompted` and
+    words already in `prompted` are skipped, so rounds sharing the same set
+    (e.g. MOST then LEAST) never ask about the same word twice."""
     sign = 1 if least_first else -1
     ordered = sorted(
         counts.items(),
@@ -450,13 +453,14 @@ def pick_round(
     picked: dict[str, int] = {}
     print(f"\n── {label} — pick up to {target}; 1=NEW, 2=KNOWN, q=stop round ──")
     for word, count in ordered:
-        if word in known:
+        if word in known or word in prompted:
             continue
         if not word_re.match(word):
             continue
         print(f"  [{count:>3}× len={len(word)}] {word}  ", end="", flush=True)
         ch = getch()
         print(ch)
+        prompted.add(word)
         if ch == "1":
             picked[word] = count
             print(f"    → NEW ({len(picked)}/{target})")
