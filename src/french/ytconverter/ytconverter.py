@@ -4,8 +4,8 @@
 End-to-end pipeline:
   1. Prompt for a YouTube URL.
   2. Download audio (yt-dlp -x mp3) into ./inputs/.
-  3. Transcribe with Google Chirp (chirp_3, fr-FR), with word-level timestamps.
-     Cache JSON.
+  3. Transcribe with Azure MAI-Transcribe-1.5 (default; pass --stt chirp for the
+     Google Chirp 3 fallback), with word-level timestamps. Cache JSON.
   4. Tokenize/lemmatize with spaCy (fr_core_news_sm) and count occurrences.
   5. Interactively pick X most-occurring + X least-occurring NEW words
      (single keypress: 1 = NEW, 2 = mark KNOWN/append to learntwords.txt).
@@ -29,8 +29,11 @@ I/O folders (created at invocation cwd):
 Credentials (next to this script):
   key.json       - {"azSpeechKey": "<Azure Cognitive Services key>",
                     "azSpeechRegion": "<e.g. eastus>",
-                    "gcsBucket": "<GCS bucket for STT staging>"}
-  jumeau-gc.json - Google Cloud service account JSON (used for STT, Translate v3)
+                    "azSttEndpoint": "<Foundry host for MAI-Transcribe, e.g.
+                                       https://<resource>.cognitiveservices.azure.com;
+                                       optional, else derived from azSpeechRegion>",
+                    "gcsBucket": "<GCS bucket for STT staging; only used with --stt chirp>"}
+  jumeau-gc.json - Google Cloud service account JSON (Translate v3; STT only with --stt chirp)
 
 Dependencies:
   pip install -r requirements.txt
@@ -82,6 +85,7 @@ from common.ytcommon import (  # noqa: E402
     split_mp3_to_flac_chunks,
     ssml_part_announcement,
     transcribe,
+    transcribe_mai,
     translate_batch,
     upload_to_gcs,
 )
@@ -107,6 +111,7 @@ FRENCH = LangConfig(
     language_code="fr-FR",
     chirp_location="us",
     chirp_model="chirp_3",
+    mai_locale="fr",
     sentence_end_chars=".!?…",
     sub_sentence_break_chars=",;:",
     word_joiner=" ",
@@ -149,8 +154,12 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket for STT staging (else read from key.json:gcsBucket)")
     parser.add_argument("--azure-region", help="Azure Speech region (else read from key.json:azSpeechRegion)")
     parser.add_argument("--chunk-minutes", type=float, default=5.0)
-    parser.add_argument("--min-speakers", type=int, default=2, help="Minimum number of speakers for diarization (default: 2, min 1)")
-    parser.add_argument("--max-speakers", type=int, default=None, help="Maximum number of speakers for diarization (default: same as --min-speakers; clamped to >= min)")
+    parser.add_argument("--stt", choices=["mai", "chirp"], default="mai",
+                        help="STT backend: mai = Azure MAI-Transcribe (default), chirp = Google Chirp 3 fallback")
+    parser.add_argument("--stt-model", default="mai-transcribe-1.5",
+                        help="MAI-Transcribe model id (used when --stt mai; default: mai-transcribe-1.5)")
+    parser.add_argument("--min-speakers", type=int, default=2, help="Minimum speakers for diarization (chirp only; default: 2, min 1)")
+    parser.add_argument("--max-speakers", type=int, default=None, help="Maximum speakers for diarization (chirp only; default: same as --min-speakers; clamped to >= min)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel chunk-build workers (default: 4)")
     args = parser.parse_args()
 
@@ -171,8 +180,9 @@ def main():
     if not az_region:
         az_region = input("Azure Speech region (e.g. eastus): ").strip()
     gcs_bucket = args.gcs_bucket or keys.get("gcsBucket")
-    if not gcs_bucket:
+    if args.stt == "chirp" and not gcs_bucket:
         gcs_bucket = input("GCS bucket for STT staging: ").strip()
+    stt_endpoint = keys.get("azSttEndpoint") or f"https://{az_region}.api.cognitive.microsoft.com"
 
     gc_path = Path(args.gc).resolve()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(gc_path)
@@ -223,39 +233,45 @@ def main():
             except (json.JSONDecodeError, ValueError, TypeError):
                 boundaries = None
     else:
-        min_speakers = max(1, args.min_speakers)
-        max_speakers = args.max_speakers if args.max_speakers is not None else min_speakers
-        max_speakers = max(min_speakers, max_speakers)
-        print(f"  → diarization: {min_speakers}-{max_speakers} speaker(s)")
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             print(f"  → MP3 → FLAC chunks (16kHz mono, ~{chunk_target_ms // 60000}min each, split at silence)")
             flac_chunks = split_mp3_to_flac_chunks(mp3_path, chunk_target_ms, td_path)
             print(f"  → {len(flac_chunks)} chunk(s)")
             boundaries = [(start, end) for _, start, end in flac_chunks]
-            timestamp = int(time.time())
-            uploaded: list[tuple[str, int, object]] = []  # (uri, offset_ms, blob)
-            for chunk_path, offset_ms, _end_ms in flac_chunks:
-                blob_name = f"stt-staging/{stem}-{timestamp}-{chunk_path.stem}.flac"
-                print(f"  → upload to gs://{gcs_bucket}/{blob_name} (+{offset_ms}ms)")
-                gcs_uri, blob = upload_to_gcs(chunk_path, gcs_bucket, blob_name)
-                uploaded.append((gcs_uri, offset_ms, blob))
-            try:
-                fr_words = transcribe(
-                    [(u, o) for u, o, _ in uploaded],
-                    project_id,
-                    FRENCH.chirp_location,
-                    FRENCH.chirp_model,
-                    FRENCH.language_code,
-                    min_speakers,
-                    max_speakers,
+            if args.stt == "mai":
+                print(f"  → MAI-Transcribe via {stt_endpoint}")
+                fr_words = transcribe_mai(
+                    flac_chunks, stt_endpoint, az_key, args.stt_model, FRENCH.mai_locale, args.workers,
                 )
-            finally:
-                for _, _, blob in uploaded:
-                    try:
-                        blob.delete()
-                    except Exception as e:
-                        print(f"  (warning: failed to delete staged blob: {e})", file=sys.stderr)
+            else:
+                min_speakers = max(1, args.min_speakers)
+                max_speakers = args.max_speakers if args.max_speakers is not None else min_speakers
+                max_speakers = max(min_speakers, max_speakers)
+                print(f"  → diarization: {min_speakers}-{max_speakers} speaker(s)")
+                timestamp = int(time.time())
+                uploaded: list[tuple[str, int, object]] = []  # (uri, offset_ms, blob)
+                for chunk_path, offset_ms, _end_ms in flac_chunks:
+                    blob_name = f"stt-staging/{stem}-{timestamp}-{chunk_path.stem}.flac"
+                    print(f"  → upload to gs://{gcs_bucket}/{blob_name} (+{offset_ms}ms)")
+                    gcs_uri, blob = upload_to_gcs(chunk_path, gcs_bucket, blob_name)
+                    uploaded.append((gcs_uri, offset_ms, blob))
+                try:
+                    fr_words = transcribe(
+                        [(u, o) for u, o, _ in uploaded],
+                        project_id,
+                        FRENCH.chirp_location,
+                        FRENCH.chirp_model,
+                        FRENCH.language_code,
+                        min_speakers,
+                        max_speakers,
+                    )
+                finally:
+                    for _, _, blob in uploaded:
+                        try:
+                            blob.delete()
+                        except Exception as e:
+                            print(f"  (warning: failed to delete staged blob: {e})", file=sys.stderr)
         print(f"  → {len(fr_words)} word records")
         sentences = build_sentences(fr_words, FRENCH)
         if sentences:

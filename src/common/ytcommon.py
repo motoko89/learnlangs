@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -62,8 +63,9 @@ class LangConfig:
     tts_rate: str               # e.g. "0.9"
     xml_lang: str               # SSML xml:lang, e.g. "zh-TW" / "fr-FR"
     language_code: str          # STT language code, e.g. "cmn-Hans-CN" / "fr-FR"
-    chirp_location: str         # STT region, e.g. "us"
-    chirp_model: str            # e.g. "chirp_3"
+    chirp_location: str         # Chirp STT region, e.g. "us"
+    chirp_model: str            # Chirp model, e.g. "chirp_3"
+    mai_locale: str             # MAI-Transcribe locale, e.g. "zh" / "fr"
     sentence_end_chars: str     # chars that terminate a sentence
     sub_sentence_break_chars: str  # chars used to subdivide long sentences
     word_joiner: str            # "" for Chinese, " " for French
@@ -291,6 +293,88 @@ def transcribe(
                         start_ms=_duration_to_ms(wi.start_offset) + offset,
                         end_ms=_duration_to_ms(wi.end_offset) + offset,
                     ))
+    words.sort(key=lambda w: w.start_ms)
+    return words
+
+
+# ─── MAI-Transcribe (Azure LLM Speech, synchronous) ───────────────────────────
+
+MAI_API_VERSION = "2025-10-15"
+
+
+def transcribe_mai(
+    flac_chunks: list[tuple[Path, int, int]],
+    host: str,
+    az_key: str,
+    model: str,
+    locale: str,
+    workers: int = 4,
+) -> list[WordRec]:
+    """Azure MAI-Transcribe over N local FLAC chunks, returning the same flat,
+    offset-applied, sorted WordRec list as :func:`transcribe`.
+
+    flac_chunks = [(path, start_ms, end_ms), ...]. Each chunk's local FLAC is POSTed
+    directly to the synchronous LLM Speech ``transcriptions:transcribe`` endpoint (no
+    GCS staging). Word timestamps are read from ``phrases[].words[]`` and shifted by the
+    chunk's start_ms. Requires word-level timestamps in the response; if a chunk yields
+    phrases without a ``words`` field, raises so the missing capability surfaces loudly
+    rather than producing an empty transcript."""
+    import requests
+
+    url = f"{host.rstrip('/')}/speechtotext/transcriptions:transcribe?api-version={MAI_API_VERSION}"
+    definition_json = json.dumps({
+        "enhancedMode": {"enabled": True, "model": model, "task": "transcribe"},
+        "locales": [locale],
+    })
+
+    def _one(chunk: tuple[Path, int, int]) -> list[WordRec]:
+        path, offset_ms, _end_ms = chunk
+        with open(path, "rb") as fh:
+            resp = requests.post(
+                url,
+                headers={"Ocp-Apim-Subscription-Key": az_key},
+                files={
+                    "audio": (path.name, fh, "audio/flac"),
+                    "definition": (None, definition_json),
+                },
+                timeout=600,
+            )
+        if not resp.ok:
+            raise RuntimeError(
+                f"MAI-Transcribe HTTP {resp.status_code} for {path.name}: {resp.text[:500]}"
+            )
+        data = resp.json()
+        phrases = data.get("phrases") or []
+        out: list[WordRec] = []
+        saw_words_field = False
+        for ph in phrases:
+            if "words" in ph:
+                saw_words_field = True
+            for w in ph.get("words") or []:
+                text = (w.get("text") or "").strip()
+                if not text:
+                    continue
+                start = int(w["offsetMilliseconds"]) + offset_ms
+                end = start + int(w["durationMilliseconds"])
+                out.append(WordRec(word=text, start_ms=start, end_ms=end))
+        if phrases and not saw_words_field:
+            raise RuntimeError(
+                f"MAI-Transcribe response for {path.name} has phrases but no word-level "
+                f"timestamps ('words' field absent); cannot build word records. "
+                f"phrase keys={list(phrases[0].keys())}."
+            )
+        return out
+
+    n = max(1, min(workers, len(flac_chunks)))
+    print(f"  → MAI-Transcribe ({model}, locale={locale}) on {len(flac_chunks)} chunk(s), {n} worker(s)")
+    words: list[WordRec] = []
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        futures = {ex.submit(_one, c): c for c in flac_chunks}
+        for fut in as_completed(futures):
+            path, offset_ms, _end_ms = futures[fut]
+            chunk_words = fut.result()
+            print(f"  · {path.name}: {len(chunk_words)} word(s) (+{offset_ms}ms)")
+            words.extend(chunk_words)
     words.sort(key=lambda w: w.start_ms)
     return words
 
