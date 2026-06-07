@@ -4,8 +4,8 @@
 End-to-end pipeline:
   1. Prompt for a YouTube URL.
   2. Download audio (yt-dlp -x mp3) into ./inputs/.
-  3. Transcribe with Azure MAI-Transcribe-1.5 (default; pass --stt chirp for the
-     Google Chirp 3 fallback), with word-level timestamps. Cache JSON.
+  3. Transcribe with Google Chirp 3 (default; pass --stt mai for Azure
+     MAI-Transcribe-1.5), with word-level timestamps. Cache JSON.
   4. Tokenize/lemmatize with spaCy (fr_core_news_sm) and count occurrences.
   5. Interactively pick X most-occurring + X least-occurring NEW words
      (single keypress: 1 = NEW, 2 = mark KNOWN/append to learntwords.txt).
@@ -29,11 +29,11 @@ I/O folders (created at invocation cwd):
 Credentials (next to this script):
   key.json       - {"azSpeechKey": "<Azure Cognitive Services key>",
                     "azSpeechRegion": "<e.g. eastus>",
-                    "azSttEndpoint": "<Foundry host for MAI-Transcribe, e.g.
-                                       https://<resource>.cognitiveservices.azure.com;
+                    "azSttEndpoint": "<Foundry host for MAI-Transcribe; only for --stt mai,
+                                       e.g. https://<resource>.cognitiveservices.azure.com;
                                        optional, else derived from azSpeechRegion>",
-                    "gcsBucket": "<GCS bucket for STT staging; only used with --stt chirp>"}
-  jumeau-gc.json - Google Cloud service account JSON (Translate v3; STT only with --stt chirp)
+                    "gcsBucket": "<GCS bucket for STT staging (default Chirp path)>"}
+  jumeau-gc.json - Google Cloud service account JSON (used for Chirp STT + Translate v3)
 
 Dependencies:
   pip install -r requirements.txt
@@ -154,8 +154,8 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket for STT staging (else read from key.json:gcsBucket)")
     parser.add_argument("--azure-region", help="Azure Speech region (else read from key.json:azSpeechRegion)")
     parser.add_argument("--chunk-minutes", type=float, default=5.0)
-    parser.add_argument("--stt", choices=["mai", "chirp"], default="mai",
-                        help="STT backend: mai = Azure MAI-Transcribe (default), chirp = Google Chirp 3 fallback")
+    parser.add_argument("--stt", choices=["mai", "chirp"], default="chirp",
+                        help="STT backend: chirp = Google Chirp 3 (default), mai = Azure MAI-Transcribe")
     parser.add_argument("--stt-model", default="mai-transcribe-1.5",
                         help="MAI-Transcribe model id (used when --stt mai; default: mai-transcribe-1.5)")
     parser.add_argument("--min-speakers", type=int, default=2, help="Minimum speakers for diarization (chirp only; default: 2, min 1)")
