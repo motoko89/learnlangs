@@ -599,21 +599,32 @@ def extract_vocab(
     return json.loads(text[start : end + 1])
 
 
-def assign_vocab_to_sentences(
-    vocab: list[dict], sentences: list["Sentence"]
-) -> dict[int, list[dict]]:
-    """Map each vocab item to the first sentence whose text contains its 'text',
-    returning {sentence_idx: [vocab_item, ...]} in vocab order. Items whose text
-    never appears verbatim are skipped (still kept in vocab.json/tsv)."""
-    by_sentence: dict[int, list[dict]] = {}
-    for v in vocab:
-        text = (v.get("text") or "").strip()
-        if not text:
-            continue
-        for idx, s in enumerate(sentences):
-            if text in s.text:
-                by_sentence.setdefault(idx, []).append(v)
-                break
+def build_vocab_ssml_by_sentence(
+    vocab: list[dict], sentences: list["Sentence"], cfg: "LangConfig"
+) -> dict[int, list[str]]:
+    """Resolve the per-sentence vocab explanation SSML, in playback order.
+
+    A vocab item is cued in every sentence whose text contains its 'text'. The
+    first time a 'text' appears (scanning sentences in time order) it gets its
+    full ``longExplainSsml``; every later sentence it reappears in gets a short
+    English-only clip built from ``shortExplain``. Returns
+    {sentence_idx: [ssml, ...]} for sentences with ≥1 cue (vocab order within a
+    sentence). Items whose text never appears verbatim are skipped (still kept
+    in vocab.json/tsv)."""
+    seen: set[str] = set()
+    by_sentence: dict[int, list[str]] = {}
+    for idx, s in enumerate(sentences):
+        for v in vocab:
+            text = (v.get("text") or "").strip()
+            if not text or text not in s.text:
+                continue
+            if text not in seen:
+                seen.add(text)
+                ssml = v.get("longExplainSsml", "")
+            else:
+                ssml = ssml_short_explain(v.get("shortExplain", ""), cfg)
+            if ssml:
+                by_sentence.setdefault(idx, []).append(ssml)
     return by_sentence
 
 
@@ -771,6 +782,15 @@ def ssml_sentence_pair(en_text: str, native_text: str, cfg: LangConfig) -> str:
         + _voice(cfg.native_voice, native_text, cfg.tts_rate)
     )
     return _wrap_ssml(body, cfg.xml_lang)
+
+
+def ssml_short_explain(short_text: str, cfg: LangConfig) -> str:
+    """English-only SSML used when a vocab item reappears in a later sentence:
+    just the short English translation in the EN voice (no foreign voice)."""
+    return _wrap_ssml(
+        _voice(cfg.en_voice, short_text or "(no translation)", cfg.tts_rate),
+        cfg.xml_lang,
+    )
 
 
 def ssml_chunk_announcement(idx: int, total: int, cfg: LangConfig) -> str:

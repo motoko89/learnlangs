@@ -68,9 +68,9 @@ from common.ytcommon import (  # noqa: E402
     Chunk,
     LangConfig,
     assemble_chunk,
-    assign_vocab_to_sentences,
     build_explanation_clip,
     build_sentences,
+    build_vocab_ssml_by_sentence,
     chunk_sentences,
     chunk_sentences_by_boundaries,
     download_youtube,
@@ -304,7 +304,7 @@ def main():
 
     # ── 4. Sentence translation (for playback pairs) ────────────────────────
     print("\n[4/6] translate sentences")
-    vocab_by_sentence = assign_vocab_to_sentences(vocab, sentences)
+    vocab_by_sentence = build_vocab_ssml_by_sentence(vocab, sentences, FRENCH)
     print(f"  → {len(vocab_by_sentence)} sentences contain ≥1 vocab item")
     all_sentence_texts = list({s.text for s in sentences})
     print(f"  → translating {len(all_sentence_texts)} sentence(s)")
@@ -331,12 +331,12 @@ def main():
     print("\n[6/6] synth + assemble")
     sentence_index: dict[int, int] = {id(s): idx for idx, s in enumerate(sentences)}
     explanations: dict[int, AudioSegment] = {}
-    for n, (idx, items) in enumerate(vocab_by_sentence.items(), 1):
+    for n, (idx, ssmls) in enumerate(vocab_by_sentence.items(), 1):
         s = sentences[idx]
         translation = sentence_translations_raw.get(s.text, "")
         explanations[idx] = build_explanation_clip(
             sentence=s,
-            vocab_ssml_in_order=[it.get("longExplainSsml", "") for it in items],
+            vocab_ssml_in_order=ssmls,
             sentence_translation=translation,
             original_audio=original_audio,
             tts_cache=tts_cache,
