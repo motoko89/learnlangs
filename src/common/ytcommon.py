@@ -519,6 +519,27 @@ def sentences_to_jsonable(sentences: list[Sentence]) -> list[dict]:
     ]
 
 
+def _srt_timestamp(ms: int) -> str:
+    """Format milliseconds as an SRT timestamp: HH:MM:SS,mmm."""
+    ms = max(0, ms)
+    hours, ms = divmod(ms, 3_600_000)
+    minutes, ms = divmod(ms, 60_000)
+    seconds, ms = divmod(ms, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{ms:03d}"
+
+
+def sentences_to_srt(sentences: list[Sentence]) -> str:
+    """Render sentences as an SRT subtitle file, one cue per sentence."""
+    blocks: list[str] = []
+    for i, s in enumerate(sentences, 1):
+        blocks.append(
+            f"{i}\n"
+            f"{_srt_timestamp(s.start_ms)} --> {_srt_timestamp(s.end_ms)}\n"
+            f"{s.text}\n"
+        )
+    return "\n".join(blocks)
+
+
 def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
     out = []
     for r in rows:
