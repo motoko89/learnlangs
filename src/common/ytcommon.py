@@ -557,7 +557,9 @@ def _vocab_prompt(
         "the context of the transcript, its format is Azure Speech-to-Text SSML. "
         "Rate will be 0.9. Voice name is en-US-AvaNeural for English, "
         f"{native_voice} for the foreign language. Switching between languages will "
-        f'have a break of {break_ms} ms. "longExplain" is plain text version of '
+        f"have a break of {break_ms} ms; every <break> must be placed inside a "
+        "<voice> element (e.g. inside the preceding voice's <prosody>), never as a "
+        'direct child of <speak>. "longExplain" is plain text version of '
         '"longExplainSsml". "shortExplain" is just short English translation.'
         f"{param4} No other response needed"
     )
@@ -700,8 +702,21 @@ def chunk_sentences(sentences: list[Sentence], target_ms: int) -> list[Chunk]:
 
 # ─── Azure TTS (cached) ───────────────────────────────────────────────────────
 
+# A <break> that sits directly under <speak> (a sibling of <voice>, not nested
+# inside it) is rejected by some voices/endpoints — notably DragonHD — with
+# "Node [speak] ... should not contain node [break]" (error 1007). The OpenAI
+# vocab SSML emits exactly this between its two <voice> blocks. Move each such
+# break to just inside the preceding </voice> so it remains a valid pause.
+_ROOT_BREAK_AFTER_VOICE_RE = re.compile(r"</voice>\s*(<break\b[^>]*/>)")
+
+
+def sanitize_ssml(ssml: str) -> str:
+    return _ROOT_BREAK_AFTER_VOICE_RE.sub(r"\1</voice>", ssml)
+
+
 def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> AudioSegment:
     cache_dir.mkdir(parents=True, exist_ok=True)
+    ssml = sanitize_ssml(ssml)
     sha = hashlib.sha1(ssml.encode("utf-8")).hexdigest()
     out_path = cache_dir / f"{sha}.mp3"
     if not out_path.exists():

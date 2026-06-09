@@ -1,9 +1,8 @@
 google-cloud-speech>=2.28
 google-cloud-storage>=2.16
-google-cloud-translate>=3.15
+google-cloud-translate>=3.26
 pydub>=0.25
-opencc-python-reimplemented>=0.1.7
-requests>=2.31
-yt-dlp>=2024.10.7
-azure-cognitiveservices-speech>=1.40
-openai>=1.50
+requests>=2.34
+yt-dlp>=2026.6.6
+azure-cognitiveservices-speech>=1.50
+openai>=2.41.0
