@@ -6,9 +6,10 @@ End-to-end pipeline:
   2. Download audio (yt-dlp -x mp3) into ./inputs/.
   3. Transcribe with Google Chirp 3 (default; pass --stt mai for Azure
      MAI-Transcribe-1.5), with word-level timestamps. Cache JSON.
-  4. Extract the top-40 vocab words/phrases with the Claude API (each item
-     carries a contextual SSML explanation, a plain-text explanation and a
-     short English gloss). Cache vocab.json, then write vocab.tsv.
+  4. Extract the top-N vocab words/phrases (N = --vocab-number, default 40) with
+     the Claude API (each item carries a contextual SSML explanation, a
+     plain-text explanation and a short English gloss). Cache vocab.json, then
+     write vocab.tsv.
   5. Translate every sentence (Cloud Translate v3) for the playback pairs.
   6. Slice the source audio into ~10-min chunks snapped to sentence ends.
   7. For each sentence containing ≥1 vocab item, render an Azure TTS explanation
@@ -125,6 +126,7 @@ def main():
     parser.add_argument("--min-speakers", type=int, default=2, help="Minimum speakers for diarization (chirp only; default: 2, min 1)")
     parser.add_argument("--max-speakers", type=int, default=None, help="Maximum speakers for diarization (chirp only; default: same as --min-speakers; clamped to >= min)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel chunk-build workers (default: 4)")
+    parser.add_argument("--vocab-number", type=int, default=40, help="Number of vocab words/phrases for Claude to extract (default: 40)")
     args = parser.parse_args()
 
     cwd = Path.cwd()
@@ -277,6 +279,7 @@ def main():
             claude_key,
             native_voice=FRENCH.native_voice,
             break_ms=INTRA_GROUP_BREAK_MS,
+            vocab_number=args.vocab_number,
             extra_field=FRENCH.vocab_extra_field,
             extra_explain=FRENCH.vocab_extra_explain,
         )

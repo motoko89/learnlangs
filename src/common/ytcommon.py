@@ -530,17 +530,20 @@ VOCAB_MODEL = "claude-opus-4-8"
 VOCAB_SYSTEM = "Act as language learning API"
 
 
-def _vocab_prompt(native_voice: str, break_ms: int, extra_field: str, extra_explain: str) -> str:
-    """Build the message from the fixed template, substituting the four params.
+def _vocab_prompt(
+    count: int, native_voice: str, break_ms: int, extra_field: str, extra_explain: str
+) -> str:
+    """Build the message from the fixed template, substituting the five params.
 
     PARAM1 = the extra JSON property (e.g. "pinyin"), PARAM2 = the foreign-language
     Azure voice, PARAM3 = the inter-language break in ms, PARAM4 = the sentence
-    describing the extra property. Empty extra_field/extra_explain drop their
-    clauses entirely (the "" if not needed case)."""
+    describing the extra property, PARAM5 = how many words/phrases to extract.
+    Empty extra_field/extra_explain drop their clauses entirely (the "" if not
+    needed case)."""
     param1 = f', "{extra_field}"' if extra_field else ""
     param4 = f" {extra_explain}" if extra_explain else ""
     return (
-        "Identify exactly top 40 words or phrases in the attached transcript that "
+        f"Identify exactly top {count} words or phrases in the attached transcript that "
         "will help an intermediate language learner understand this conversation. "
         "Focus on: key words/phrases that are crucial to understand the whole "
         "conversation, rare words/phrases, words/phrases that are "
@@ -564,16 +567,18 @@ def extract_vocab(
     api_key: str,
     native_voice: str,
     break_ms: int,
+    vocab_number: int = 40,
     extra_field: str = "",
     extra_explain: str = "",
     model: str = VOCAB_MODEL,
 ) -> list[dict]:
-    """Ask Claude (max effort, adaptive thinking) for the top-40 vocab items and
-    return the parsed JSON array. Each item carries 'text', 'longExplainSsml',
-    'longExplain', 'shortExplain' (+ extra_field, e.g. 'pinyin')."""
+    """Ask Claude (max effort, adaptive thinking) for the top-`vocab_number` vocab
+    items and return the parsed JSON array. Each item carries 'text',
+    'longExplainSsml', 'longExplain', 'shortExplain' (+ extra_field, e.g.
+    'pinyin')."""
     import anthropic
 
-    prompt = _vocab_prompt(native_voice, break_ms, extra_field, extra_explain)
+    prompt = _vocab_prompt(vocab_number, native_voice, break_ms, extra_field, extra_explain)
     client = anthropic.Anthropic(api_key=api_key)
     with client.messages.stream(
         model=model,
