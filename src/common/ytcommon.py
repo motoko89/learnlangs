@@ -216,6 +216,7 @@ class WordRec:
     word: str
     start_ms: int
     end_ms: int
+    speaker: str | None = None
 
 
 def _duration_to_ms(d) -> int:
@@ -284,7 +285,8 @@ def transcribe(
                 alt = result.alternatives[0]
                 if ri == 0:
                     preview = (alt.transcript or "")[:80].replace("\n", " ")
-                    print(f"    [{ri}] words={len(alt.words)} transcript[:80]={preview!r}")
+                    speakers = {w.speaker_label for w in alt.words if w.speaker_label}
+                    print(f"    [{ri}] words={len(alt.words)} speakers={sorted(speakers)} transcript[:80]={preview!r}")
                 for wi in alt.words:
                     if not wi.word:
                         continue
@@ -292,6 +294,7 @@ def transcribe(
                         word=wi.word,
                         start_ms=_duration_to_ms(wi.start_offset) + offset,
                         end_ms=_duration_to_ms(wi.end_offset) + offset,
+                        speaker=wi.speaker_label or None,
                     ))
     words.sort(key=lambda w: w.start_ms)
     return words
@@ -445,20 +448,36 @@ def _split_long_sentence(s: Sentence, joiner: str, sub_break_chars: str) -> list
     return pieces
 
 
-def build_sentences(words: list[WordRec], cfg: LangConfig) -> list[Sentence]:
+def build_sentences(
+    words: list[WordRec], cfg: LangConfig, split_on_speaker_change: bool = False
+) -> list[Sentence]:
     """Three-pass segmentation:
-    1) Split at cfg.sentence_end_chars.
+    1) Split at cfg.sentence_end_chars. When split_on_speaker_change is set
+       (diarization with >1 speaker), also force a boundary wherever the
+       speaker label changes between adjacent words.
     2) Sentences shorter than MIN_SENTENCE_MS are merged into the next one
        (or, if the tail is short, into the previous one).
     3) Sentences longer than MAX_SENTENCE_MS are subdivided into
        ceil(length / MAX_SENTENCE_MS) roughly equal pieces."""
     raw: list[list[WordRec]] = []
     buf: list[WordRec] = []
+    prev_speaker: str | None = None
     for w in words:
+        if (
+            split_on_speaker_change
+            and buf
+            and prev_speaker
+            and w.speaker
+            and w.speaker != prev_speaker
+        ):
+            raw.append(buf)
+            buf = []
         buf.append(w)
         if w.word and w.word[-1] in cfg.sentence_end_chars:
             raw.append(buf)
             buf = []
+        if w.speaker:
+            prev_speaker = w.speaker
     if buf:
         raw.append(buf)
 

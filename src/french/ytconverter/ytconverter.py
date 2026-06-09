@@ -233,6 +233,7 @@ def main():
             except (json.JSONDecodeError, ValueError, TypeError):
                 boundaries = None
     else:
+        speaker_split = False
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             print(f"  → MP3 → FLAC chunks (16kHz mono, ~{chunk_target_ms // 60000}min each, split at silence)")
@@ -248,6 +249,7 @@ def main():
                 min_speakers = max(1, args.min_speakers)
                 max_speakers = args.max_speakers if args.max_speakers is not None else min_speakers
                 max_speakers = max(min_speakers, max_speakers)
+                speaker_split = max_speakers > 1
                 print(f"  → diarization: {min_speakers}-{max_speakers} speaker(s)")
                 timestamp = int(time.time())
                 uploaded: list[tuple[str, int, object]] = []  # (uri, offset_ms, blob)
@@ -273,7 +275,7 @@ def main():
                         except Exception as e:
                             print(f"  (warning: failed to delete staged blob: {e})", file=sys.stderr)
         print(f"  → {len(fr_words)} word records")
-        sentences = build_sentences(fr_words, FRENCH)
+        sentences = build_sentences(fr_words, FRENCH, split_on_speaker_change=speaker_split)
         if sentences:
             transcript_json_path.write_text(
                 json.dumps(sentences_to_jsonable(sentences), ensure_ascii=False, indent=2),
