@@ -560,7 +560,7 @@ def _vocab_prompt(
         f"have a break of {break_ms} ms; every <break> must be placed inside a "
         "<voice> element (e.g. inside the preceding voice's <prosody>), never as a "
         'direct child of <speak>. "longExplain" is plain text version of '
-        '"longExplainSsml". "shortExplain" is just short English translation.'
+        '"longExplainSsml". "shortExplain" is just short English translation. Do not repeat "text" at the beginning of "longExplainSsml" and "longExplain". Do not start with "this is" at the beginning of "longExplainSsml" and "longExplain", go straight to explaining'
         f"{param4} No other response needed"
     )
 
