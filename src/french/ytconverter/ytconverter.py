@@ -7,20 +7,20 @@ End-to-end pipeline:
   3. Transcribe with Google Chirp 3 (default; pass --stt mai for Azure
      MAI-Transcribe-1.5), with word-level timestamps. Cache JSON.
   4. Extract the top-N vocab words/phrases (N = --vocab-number, default 40) with
-     the Claude API (each item carries a contextual SSML explanation, a
+     the OpenAI API (each item carries a contextual SSML explanation, a
      plain-text explanation and a short English gloss). Cache vocab.json, then
      write vocab.tsv.
   5. Translate every sentence (Cloud Translate v3) for the playback pairs.
   6. Slice the source audio into ~10-min chunks snapped to sentence ends.
   7. For each sentence containing ≥1 vocab item, render an Azure TTS explanation
-     clip = Claude's per-vocab SSML explanation(s) + original sentence slice +
+     clip = OpenAI's per-vocab SSML explanation(s) + original sentence slice +
      synthetic sentence TTS + English sentence translation, with 500 ms breaks.
   8. Assemble each chunk:
        original_chunk + 1s + part1 + expl1 + 1s + part2 + expl2 + 1s + … + tail
      and concatenate all chunks (2s between chunks) into outputs/<stem>.mp3.
 
 Language-agnostic pipeline code lives in src/common/ytcommon.py; this script
-only carries the French-specific pieces (language codes, the Claude vocab
+only carries the French-specific pieces (language codes, the OpenAI vocab
 params, and the voices).
 
 I/O folders (created at invocation cwd):
@@ -35,7 +35,7 @@ Credentials (next to this script):
                                        e.g. https://<resource>.cognitiveservices.azure.com;
                                        optional, else derived from azSpeechRegion>",
                     "gcsBucket": "<GCS bucket for STT staging (default Chirp path)>",
-                    "cApi": "<Claude API key for vocab extraction>"}
+                    "cApi": "<OpenAI API key for vocab extraction>"}
   jumeau-gc.json - Google Cloud service account JSON (used for Chirp STT + Translate v3)
 
 Dependencies:
@@ -126,7 +126,7 @@ def main():
     parser.add_argument("--min-speakers", type=int, default=2, help="Minimum speakers for diarization (chirp only; default: 2, min 1)")
     parser.add_argument("--max-speakers", type=int, default=None, help="Maximum speakers for diarization (chirp only; default: same as --min-speakers; clamped to >= min)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel chunk-build workers (default: 4)")
-    parser.add_argument("--vocab-number", type=int, default=40, help="Number of vocab words/phrases for Claude to extract (default: 40)")
+    parser.add_argument("--vocab-number", type=int, default=40, help="Number of vocab words/phrases for OpenAI to extract (default: 40)")
     args = parser.parse_args()
 
     cwd = Path.cwd()
@@ -147,9 +147,9 @@ def main():
     if args.stt == "chirp" and not gcs_bucket:
         gcs_bucket = input("GCS bucket for STT staging: ").strip()
     stt_endpoint = keys.get("azSttEndpoint") or f"https://{az_region}.api.cognitive.microsoft.com"
-    claude_key = keys.get("cApi")
-    if not claude_key:
-        print("key.json must contain 'cApi' (Claude API key).", file=sys.stderr)
+    ai_key = keys.get("cApi")
+    if not ai_key:
+        print("key.json must contain 'cApi' (OpenAI API key).", file=sys.stderr)
         sys.exit(1)
 
     gc_path = Path(args.gc).resolve()
@@ -264,8 +264,8 @@ def main():
 
     transcript_text = " ".join(s.text for s in sentences)
 
-    # ── 3. Vocab extraction (Claude, cached) ────────────────────────────────
-    print("\n[3/6] vocab (Claude)")
+    # ── 3. Vocab extraction (OpenAI, cached) ────────────────────────────────
+    print("\n[3/6] vocab (OpenAI)")
     vocab: list[dict] = []
     if vocab_json_path.exists() and vocab_json_path.stat().st_size > 0:
         try:
@@ -276,7 +276,7 @@ def main():
     if not vocab:
         vocab = extract_vocab(
             transcript_text,
-            claude_key,
+            ai_key,
             native_voice=FRENCH.native_voice,
             break_ms=INTRA_GROUP_BREAK_MS,
             vocab_number=args.vocab_number,
@@ -288,7 +288,7 @@ def main():
         )
         print(f"  → {len(vocab)} vocab items → {vocab_json_path.name}")
     if not vocab:
-        print("Claude returned no vocab items; nothing to synthesize. Exiting.")
+        print("AI returned no vocab items; nothing to synthesize. Exiting.")
         sys.exit(0)
 
     # vocab.tsv: text, [extra field], longExplain, shortExplain

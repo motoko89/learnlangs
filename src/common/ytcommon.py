@@ -3,11 +3,11 @@
 generators (see src/<lang>/ytconverter/ytconverter.py).
 
 Everything here is language-agnostic. Language-specific behaviour (script
-post-processing, voices, language codes, the Claude vocab params) lives in the
+post-processing, voices, language codes, the OpenAI vocab params) lives in the
 per-language scripts and is injected via :class:`LangConfig` or explicit
 arguments. Heavy third-party libraries are imported lazily inside the functions
 that need them so importing this module is cheap and never forces a
-language-specific dependency (opencc, azure, google, anthropic, ...).
+language-specific dependency (opencc, azure, google, openai, ...).
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ class LangConfig:
     sub_sentence_break_chars: str  # chars used to subdivide long sentences
     word_joiner: str            # "" for Chinese, " " for French
     translate_source: str       # Cloud Translate source code, e.g. "zh-TW" / "fr"
-    vocab_extra_field: str = ""     # extra Claude JSON property name, e.g. "pinyin" ("" if none)
+    vocab_extra_field: str = ""     # extra OpenAI JSON property name, e.g. "pinyin" ("" if none)
     vocab_extra_explain: str = ""   # sentence describing the extra property ("" if none)
 
 
@@ -524,10 +524,11 @@ def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
     return out
 
 
-# ─── Claude vocab extraction ──────────────────────────────────────────────────
+# ─── Azure OpenAI vocab extraction ────────────────────────────────────────────
 
-VOCAB_MODEL = "claude-opus-4-8"
+VOCAB_MODEL = "gpt-5.4"
 VOCAB_SYSTEM = "Act as language learning API"
+AZURE_OPENAI_BASE_URL = "https://ai-learnlangs-foundry.services.ai.azure.com/openai/v1"
 
 
 def _vocab_prompt(
@@ -572,28 +573,27 @@ def extract_vocab(
     extra_explain: str = "",
     model: str = VOCAB_MODEL,
 ) -> list[dict]:
-    """Ask Claude (max effort, adaptive thinking) for the top-`vocab_number` vocab
+    """Ask Azure OpenAI (high reasoning effort) for the top-`vocab_number` vocab
     items and return the parsed JSON array. Each item carries 'text',
     'longExplainSsml', 'longExplain', 'shortExplain' (+ extra_field, e.g.
     'pinyin')."""
-    import anthropic
+    from openai import OpenAI
 
     prompt = _vocab_prompt(vocab_number, native_voice, break_ms, extra_field, extra_explain)
-    client = anthropic.Anthropic(api_key=api_key)
-    with client.messages.stream(
+    client = OpenAI(base_url=AZURE_OPENAI_BASE_URL, api_key=api_key)
+    response = client.chat.completions.create(
         model=model,
-        max_tokens=64000,
-        system=VOCAB_SYSTEM,
-        thinking={"type": "adaptive"},
-        output_config={"effort": "max"},
-        messages=[{"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript_text}"}],
-    ) as stream:
-        message = stream.get_final_message()
+        reasoning_effort="high",
+        messages=[
+            {"role": "system", "content": VOCAB_SYSTEM},
+            {"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript_text}"},
+        ],
+    )
 
-    text = "".join(b.text for b in message.content if b.type == "text").strip()
+    text = (response.choices[0].message.content or "").strip()
     start, end = text.find("["), text.rfind("]")
     if start == -1 or end == -1 or end < start:
-        raise RuntimeError(f"Claude vocab response had no JSON array:\n{text[:1000]}")
+        raise RuntimeError(f"Azure OpenAI vocab response had no JSON array:\n{text[:1000]}")
     return json.loads(text[start : end + 1])
 
 
@@ -790,7 +790,7 @@ def build_explanation_clip(
     cfg: LangConfig,
 ) -> AudioSegment:
     """Per-sentence clip for sentences containing ≥1 new vocab item:
-    Claude's per-vocab SSML explanations + original_slice + EN/native sentence
+    OpenAI's per-vocab SSML explanations + original_slice + EN/native sentence
     pair + original_slice, with 500 ms breaks. Each entry of
     vocab_ssml_in_order is a full Azure SSML document (the item's
     ``longExplainSsml``) rendered directly."""

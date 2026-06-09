@@ -6,4 +6,4 @@ opencc-python-reimplemented>=0.1.7
 requests>=2.31
 yt-dlp>=2024.10.7
 azure-cognitiveservices-speech>=1.40
-anthropic>=0.40
+openai>=1.50
