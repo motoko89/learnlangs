@@ -220,7 +220,7 @@ def main():
                 min_speakers = max(1, args.min_speakers)
                 max_speakers = args.max_speakers if args.max_speakers is not None else min_speakers
                 max_speakers = max(min_speakers, max_speakers)
-                speaker_split = max_speakers > 1
+                speaker_split = min_speakers > 1
                 print(f"  → diarization: {min_speakers}-{max_speakers} speaker(s)")
                 timestamp = int(time.time())
                 uploaded: list[tuple[str, int, object]] = []  # (uri, offset_ms, blob)
