@@ -104,7 +104,7 @@ KNOWN_HEADER = (
 )
 
 FRENCH = LangConfig(
-    native_voice="fr-FR-DeniseNeural",
+    native_voice="fr-FR-Remy:DragonHDLatestNeural",
     en_voice="en-US-AvaNeural",
     tts_rate="0.9",
     xml_lang="fr-FR",
