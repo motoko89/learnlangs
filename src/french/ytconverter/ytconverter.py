@@ -81,14 +81,13 @@ from common.ytcommon import (  # noqa: E402
     render_tts,
     sanitize_stem,
     sentences_from_jsonable,
-    sentences_to_jsonable,
-    sentences_to_srt,
     split_mp3_to_flac_chunks,
     ssml_part_announcement,
     transcribe,
     transcribe_mai,
     translate_batch,
     upload_to_gcs,
+    write_transcript_files,
 )
 
 # spaCy Universal POS tags to drop: function words, punctuation, numbers, etc.
@@ -206,6 +205,7 @@ def main():
     chunks_cache = inter_dir / "chunks"
     transcript_json_path = inter_dir / "transcript.json"
     transcript_srt_path = inter_dir / "transcript.srt"
+    transcript_txt_path = inter_dir / "transcript.txt"
     boundaries_json_path = inter_dir / "chunk_boundaries.json"
     vocab_tsv_path = inter_dir / "vocab.tsv"
     for stale in (tts_cache, chunks_cache):
@@ -279,14 +279,9 @@ def main():
         print(f"  → {len(fr_words)} word records")
         sentences = build_sentences(fr_words, FRENCH, split_on_speaker_change=speaker_split)
         if sentences:
-            transcript_json_path.write_text(
-                json.dumps(sentences_to_jsonable(sentences), ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            write_transcript_files(
+                sentences, transcript_json_path, transcript_srt_path, transcript_txt_path
             )
-            transcript_srt_path.write_text(
-                sentences_to_srt(sentences), encoding="utf-8"
-            )
-            print(f"  → {len(sentences)} sentences → {transcript_json_path.name}, {transcript_srt_path.name}")
             boundaries_json_path.write_text(
                 json.dumps(boundaries), encoding="utf-8"
             )

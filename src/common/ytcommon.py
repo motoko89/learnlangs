@@ -540,6 +540,20 @@ def sentences_to_srt(sentences: list[Sentence]) -> str:
     return "\n".join(blocks)
 
 
+def write_transcript_files(
+    sentences: list[Sentence], json_path: Path, srt_path: Path, txt_path: Path
+) -> None:
+    """Write the transcript in all three sibling formats: JSON (full records),
+    SRT (one cue per sentence), and TXT (one sentence text per line)."""
+    json_path.write_text(
+        json.dumps(sentences_to_jsonable(sentences), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    srt_path.write_text(sentences_to_srt(sentences), encoding="utf-8")
+    txt_path.write_text("\n".join(s.text for s in sentences) + "\n", encoding="utf-8")
+    print(f"  → {len(sentences)} sentences → {json_path.name}, {srt_path.name}, {txt_path.name}")
+
+
 def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
     out = []
     for r in rows:
