@@ -2,12 +2,12 @@
 """Shared pipeline for the per-language YouTube → Vocab Listening-Practice
 generators (see src/<lang>/ytconverter/ytconverter.py).
 
-Everything here is language-agnostic. Language-specific behaviour (tokenizer,
-script post-processing, pinyin/transliteration, word filter, voices, language
-codes) lives in the per-language scripts and is injected via :class:`LangConfig`
-or explicit arguments. Heavy third-party libraries are imported lazily inside
-the functions that need them so importing this module is cheap and never forces
-a language-specific dependency (jieba, opencc, spacy, azure, google, ...).
+Everything here is language-agnostic. Language-specific behaviour (script
+post-processing, voices, language codes, the Claude vocab params) lives in the
+per-language scripts and is injected via :class:`LangConfig` or explicit
+arguments. Heavy third-party libraries are imported lazily inside the functions
+that need them so importing this module is cheap and never forces a
+language-specific dependency (opencc, azure, google, anthropic, ...).
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,25 +69,8 @@ class LangConfig:
     sub_sentence_break_chars: str  # chars used to subdivide long sentences
     word_joiner: str            # "" for Chinese, " " for French
     translate_source: str       # Cloud Translate source code, e.g. "zh-TW" / "fr"
-
-
-# ─── Single-keypress input ────────────────────────────────────────────────────
-
-def getch() -> str:
-    """Read a single character from stdin with no Enter required (POSIX)."""
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    if ch == "\x03":
-        raise KeyboardInterrupt
-    return ch
+    vocab_extra_field: str = ""     # extra Claude JSON property name, e.g. "pinyin" ("" if none)
+    vocab_extra_explain: str = ""   # sentence describing the extra property ("" if none)
 
 
 # ─── Bootstrap / config ───────────────────────────────────────────────────────
@@ -107,30 +89,6 @@ def sanitize_stem(stem: str) -> str:
     """Make a filesystem-safe stem (also used as cache directory name)."""
     cleaned = re.sub(r"[^\w\-. ]+", "_", stem, flags=re.UNICODE).strip()
     return cleaned or f"episode-{int(time.time())}"
-
-
-# ─── Known-words list (HSK list for Mandarin, learntwords for French, ...) ─────
-
-def ensure_known_file(path: Path, header: str) -> None:
-    if not path.exists():
-        path.write_text(header, encoding="utf-8")
-        print(f"  created empty known-words list: {path}")
-
-
-def load_known_words(path: Path) -> set[str]:
-    if not path.exists():
-        return set()
-    with open(path, encoding="utf-8-sig") as f:
-        return {line.strip() for line in f if line.strip() and not line.startswith("#")}
-
-
-def append_known_word(path: Path, word: str) -> None:
-    data = path.read_bytes() if path.exists() else b""
-    needs_newline = data and not data.endswith(b"\n")
-    with open(path, "ab") as f:
-        if needs_newline:
-            f.write(b"\n")
-        f.write(word.encode("utf-8") + b"\n")
 
 
 # ─── yt-dlp download ──────────────────────────────────────────────────────────
@@ -566,54 +524,90 @@ def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
     return out
 
 
-# ─── Interactive vocab picker ─────────────────────────────────────────────────
+# ─── Claude vocab extraction ──────────────────────────────────────────────────
 
-def pick_round(
-    label: str,
-    counts: Counter,
-    known: set[str],
-    target: int,
-    least_first: bool,
-    word_re: re.Pattern,
-    known_path: Path,
-    prompted: set[str],
-) -> dict[str, int]:
-    """Iterate candidates and prompt single-keypress 1=NEW, 2=KNOWN, q=stop.
-    Returns dict {word: count} for accepted-as-new words. Words answered KNOWN
-    are appended to known_path. Every word shown is recorded in `prompted` and
-    words already in `prompted` are skipped, so rounds sharing the same set
-    (e.g. MOST then LEAST) never ask about the same word twice."""
-    sign = 1 if least_first else -1
-    ordered = sorted(
-        counts.items(),
-        key=lambda x: (sign * x[1], -len(x[0]), x[0]),
+VOCAB_MODEL = "claude-opus-4-8"
+VOCAB_SYSTEM = "Act as language learning API"
+
+
+def _vocab_prompt(native_voice: str, break_ms: int, extra_field: str, extra_explain: str) -> str:
+    """Build the message from the fixed template, substituting the four params.
+
+    PARAM1 = the extra JSON property (e.g. "pinyin"), PARAM2 = the foreign-language
+    Azure voice, PARAM3 = the inter-language break in ms, PARAM4 = the sentence
+    describing the extra property. Empty extra_field/extra_explain drop their
+    clauses entirely (the "" if not needed case)."""
+    param1 = f', "{extra_field}"' if extra_field else ""
+    param4 = f" {extra_explain}" if extra_explain else ""
+    return (
+        "Identify exactly top 40 words or phrases in the attached transcript that "
+        "will help an intermediate language learner understand this conversation. "
+        "Focus on: key words/phrases that are crucial to understand the whole "
+        "conversation, rare words/phrases, words/phrases that are "
+        "upper-intermediate/advanced vocabulary, or daily expressions. For "
+        "non-Latin language, e.g. Mandarin, also include advanced, or obscured "
+        "private names of places, e.g. countries, cities. Output these "
+        "words/phrases into a JSON array. Each JSON object has these properties: "
+        f'"text", "longExplainSsml", "longExplain", "shortExplain"{param1}. "text" '
+        'is the original text. "longExplainSsml" is the explanation of the text in '
+        "the context of the transcript, its format is Azure Speech-to-Text SSML. "
+        "Rate will be 0.9. Voice name is en-US-AvaNeural for English, "
+        f"{native_voice} for the foreign language. Switching between languages will "
+        f'have a break of {break_ms} ms. "longExplain" is plain text version of '
+        '"longExplainSsml". "shortExplain" is just short English translation.'
+        f"{param4} No other response needed"
     )
-    picked: dict[str, int] = {}
-    print(f"\n── {label} — pick up to {target}; 1=NEW, 2=KNOWN, q=stop round ──")
-    for word, count in ordered:
-        if word in known or word in prompted:
+
+
+def extract_vocab(
+    transcript_text: str,
+    api_key: str,
+    native_voice: str,
+    break_ms: int,
+    extra_field: str = "",
+    extra_explain: str = "",
+    model: str = VOCAB_MODEL,
+) -> list[dict]:
+    """Ask Claude (max effort, adaptive thinking) for the top-40 vocab items and
+    return the parsed JSON array. Each item carries 'text', 'longExplainSsml',
+    'longExplain', 'shortExplain' (+ extra_field, e.g. 'pinyin')."""
+    import anthropic
+
+    prompt = _vocab_prompt(native_voice, break_ms, extra_field, extra_explain)
+    client = anthropic.Anthropic(api_key=api_key)
+    with client.messages.stream(
+        model=model,
+        max_tokens=64000,
+        system=VOCAB_SYSTEM,
+        thinking={"type": "adaptive"},
+        output_config={"effort": "max"},
+        messages=[{"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript_text}"}],
+    ) as stream:
+        message = stream.get_final_message()
+
+    text = "".join(b.text for b in message.content if b.type == "text").strip()
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        raise RuntimeError(f"Claude vocab response had no JSON array:\n{text[:1000]}")
+    return json.loads(text[start : end + 1])
+
+
+def assign_vocab_to_sentences(
+    vocab: list[dict], sentences: list["Sentence"]
+) -> dict[int, list[dict]]:
+    """Map each vocab item to the first sentence whose text contains its 'text',
+    returning {sentence_idx: [vocab_item, ...]} in vocab order. Items whose text
+    never appears verbatim are skipped (still kept in vocab.json/tsv)."""
+    by_sentence: dict[int, list[dict]] = {}
+    for v in vocab:
+        text = (v.get("text") or "").strip()
+        if not text:
             continue
-        if not word_re.match(word):
-            continue
-        print(f"  [{count:>3}× len={len(word)}] {word}  ", end="", flush=True)
-        ch = getch()
-        print(ch)
-        prompted.add(word)
-        if ch == "1":
-            picked[word] = count
-            print(f"    → NEW ({len(picked)}/{target})")
-            if len(picked) >= target:
+        for idx, s in enumerate(sentences):
+            if text in s.text:
+                by_sentence.setdefault(idx, []).append(v)
                 break
-        elif ch == "2":
-            known.add(word)
-            append_known_word(known_path, word)
-            print("    → KNOWN (added to known-words list)")
-        elif ch.lower() == "q":
-            print("    → stop")
-            break
-        else:
-            print("    → skip")
-    return picked
+    return by_sentence
 
 
 # ─── Cloud Translate v3 ───────────────────────────────────────────────────────
@@ -751,17 +745,6 @@ def _wrap_ssml(body: str, xml_lang: str) -> str:
     )
 
 
-def ssml_words_and_meanings(pairs: list[tuple[str, str]], cfg: LangConfig) -> str:
-    """pairs = [(native_word, english_meaning), ...]"""
-    parts: list[str] = []
-    for i, (w, en) in enumerate(pairs):
-        # break before each pair after the first — placed inside the leading voice
-        lead = INTRA_GROUP_BREAK_MS if i else 0
-        parts.append(_voice(cfg.native_voice, w, cfg.tts_rate, lead_break_ms=lead, trail_break_ms=INTRA_GROUP_BREAK_MS))
-        parts.append(_voice(cfg.en_voice, en or "(no translation)", cfg.tts_rate))
-    return _wrap_ssml("".join(parts), cfg.xml_lang)
-
-
 def ssml_sentence_pair(en_text: str, native_text: str, cfg: LangConfig) -> str:
     body = (
         _voice(cfg.en_voice, en_text or "(no translation)", cfg.tts_rate, trail_break_ms=INTRA_GROUP_BREAK_MS)
@@ -793,8 +776,7 @@ def ssml_part_announcement(part_num: int, total_parts: int, cfg: LangConfig) -> 
 
 def build_explanation_clip(
     sentence: Sentence,
-    new_words_in_order: list[str],
-    word_meanings: dict[str, str],
+    vocab_ssml_in_order: list[str],
     sentence_translation: str,
     original_audio: AudioSegment,
     tts_cache: Path,
@@ -802,14 +784,22 @@ def build_explanation_clip(
     az_region: str,
     cfg: LangConfig,
 ) -> AudioSegment:
-    pairs = [(w, word_meanings.get(w, "")) for w in new_words_in_order]
-    clip_a = render_tts(ssml_words_and_meanings(pairs, cfg), tts_cache, az_key, az_region)
+    """Per-sentence clip for sentences containing ≥1 new vocab item:
+    Claude's per-vocab SSML explanations + original_slice + EN/native sentence
+    pair + original_slice, with 500 ms breaks. Each entry of
+    vocab_ssml_in_order is a full Azure SSML document (the item's
+    ``longExplainSsml``) rendered directly."""
+    gap = AudioSegment.silent(duration=INTRA_GROUP_BREAK_MS)
+    clip_a = AudioSegment.silent(duration=0)
+    for i, ssml in enumerate(s for s in vocab_ssml_in_order if s):
+        if i:
+            clip_a += gap
+        clip_a += render_tts(ssml, tts_cache, az_key, az_region)
     original_slice = original_audio[sentence.start_ms : sentence.end_ms]
     clip_b = render_tts(
         ssml_sentence_pair(sentence_translation, sentence.text, cfg),
         tts_cache, az_key, az_region,
     )
-    gap = AudioSegment.silent(duration=INTRA_GROUP_BREAK_MS)
     return clip_a + gap + original_slice + gap + clip_b + gap + original_slice
 
 

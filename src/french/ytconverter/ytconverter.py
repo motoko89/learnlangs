@@ -6,24 +6,25 @@ End-to-end pipeline:
   2. Download audio (yt-dlp -x mp3) into ./inputs/.
   3. Transcribe with Google Chirp 3 (default; pass --stt mai for Azure
      MAI-Transcribe-1.5), with word-level timestamps. Cache JSON.
-  4. Tokenize/lemmatize with spaCy (fr_core_news_sm) and count occurrences.
-  5. Interactively pick X most-occurring + X least-occurring NEW words
-     (single keypress: 1 = NEW, 2 = mark KNOWN/append to learntwords.txt).
+  4. Extract the top-40 vocab words/phrases with the Claude API (each item
+     carries a contextual SSML explanation, a plain-text explanation and a
+     short English gloss). Cache vocab.json, then write vocab.tsv.
+  5. Translate every sentence (Cloud Translate v3) for the playback pairs.
   6. Slice the source audio into ~10-min chunks snapped to sentence ends.
-  7. For each sentence containing ≥1 new word, render an Azure TTS explanation
-     clip = word(s) + English meaning(s) + original sentence slice + synthetic
-     sentence TTS + English sentence translation, with 500 ms breaks.
+  7. For each sentence containing ≥1 vocab item, render an Azure TTS explanation
+     clip = Claude's per-vocab SSML explanation(s) + original sentence slice +
+     synthetic sentence TTS + English sentence translation, with 500 ms breaks.
   8. Assemble each chunk:
        original_chunk + 1s + part1 + expl1 + 1s + part2 + expl2 + 1s + … + tail
      and concatenate all chunks (2s between chunks) into outputs/<stem>.mp3.
 
 Language-agnostic pipeline code lives in src/common/ytcommon.py; this script
-only carries the French-specific pieces (spaCy tokenizer/lemmatizer, the
-learnt-words list, and the voices).
+only carries the French-specific pieces (language codes, the Claude vocab
+params, and the voices).
 
 I/O folders (created at invocation cwd):
   inputs/                 - downloaded MP3
-  intermediates/<stem>/   - transcript.json, vocab.tsv, tts/, chunks/
+  intermediates/<stem>/   - transcript.json, vocab.json, vocab.tsv, tts/, chunks/
   outputs/                - final concatenated study MP3
 
 Credentials (next to this script):
@@ -32,12 +33,12 @@ Credentials (next to this script):
                     "azSttEndpoint": "<Foundry host for MAI-Transcribe; only for --stt mai,
                                        e.g. https://<resource>.cognitiveservices.azure.com;
                                        optional, else derived from azSpeechRegion>",
-                    "gcsBucket": "<GCS bucket for STT staging (default Chirp path)>"}
+                    "gcsBucket": "<GCS bucket for STT staging (default Chirp path)>",
+                    "cApi": "<Claude API key for vocab extraction>"}
   jumeau-gc.json - Google Cloud service account JSON (used for Chirp STT + Translate v3)
 
 Dependencies:
   pip install -r requirements.txt
-  python -m spacy download fr_core_news_sm
   brew install ffmpeg   # pydub MP3 decode; also used by yt-dlp
   python3 ytconverter.py
 """
@@ -48,12 +49,10 @@ import argparse
 import csv
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -64,20 +63,19 @@ from pydub import AudioSegment
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from common.ytcommon import (  # noqa: E402
     INTER_CHUNK_BREAK_MS,
+    INTRA_GROUP_BREAK_MS,
     Chunk,
     LangConfig,
-    WordRec,
     assemble_chunk,
+    assign_vocab_to_sentences,
     build_explanation_clip,
     build_sentences,
     chunk_sentences,
     chunk_sentences_by_boundaries,
     download_youtube,
     ensure_dirs,
-    ensure_known_file,
+    extract_vocab,
     load_keys,
-    load_known_words,
-    pick_round,
     render_tts,
     sanitize_stem,
     sentences_from_jsonable,
@@ -90,18 +88,7 @@ from common.ytcommon import (  # noqa: E402
     write_transcript_files,
 )
 
-# spaCy Universal POS tags to drop: function words, punctuation, numbers, etc.
-SKIP_POS = {"DET", "ADP", "CCONJ", "SCONJ", "PRON", "AUX", "PART", "PUNCT", "NUM", "SYM", "X", "SPACE", "INTJ"}
-# Vocab-picker filter: a French word (lowercase, accents, internal apostrophe/hyphen).
-FRENCH_WORD_RE = re.compile(r"^[a-zà-öø-ÿœæ][a-zà-öø-ÿœæ'’\-]*$")
-
 SCRIPT_DIR = Path(__file__).resolve().parent
-KNOWN_PATH = SCRIPT_DIR / "learntwords.txt"
-KNOWN_HEADER = (
-    "# Learnt French words — one base form (lemma) per line.\n"
-    "# Words NOT in this list are flagged as candidates by ytconverter.py.\n"
-    "# Add one word per line; lines starting with '#' are ignored.\n\n"
-)
 
 FRENCH = LangConfig(
     native_voice="fr-FR-Remy:DragonHDLatestNeural",
@@ -116,32 +103,9 @@ FRENCH = LangConfig(
     sub_sentence_break_chars=",;:",
     word_joiner=" ",
     translate_source="fr",
+    vocab_extra_field="",
+    vocab_extra_explain="",
 )
-
-
-# ─── French tokenization (spaCy lemmatizer) ───────────────────────────────────
-
-_NLP = None
-
-
-def tokenize(text: str) -> list[tuple[str, str]]:
-    """Return [(lemma, pos), ...] keeping content words only. Lemmatizing means
-    conjugations/inflections collapse to their base form (mange/mangé/mangeons
-    → manger; belle/beaux → beau)."""
-    global _NLP
-    if _NLP is None:
-        import spacy
-        _NLP = spacy.load("fr_core_news_sm", disable=["parser", "ner"])
-
-    out: list[tuple[str, str]] = []
-    for t in _NLP(text):
-        lemma = t.lemma_.lower().strip()
-        if not lemma or t.pos_ in SKIP_POS:
-            continue
-        if len(lemma) < 2 or not FRENCH_WORD_RE.match(lemma):
-            continue
-        out.append((lemma, t.pos_))
-    return out
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -163,8 +127,6 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="Parallel chunk-build workers (default: 4)")
     args = parser.parse_args()
 
-    ensure_known_file(KNOWN_PATH, KNOWN_HEADER)
-
     cwd = Path.cwd()
     inputs_dir = cwd / "inputs"
     intermediates_root = cwd / "intermediates"
@@ -183,6 +145,10 @@ def main():
     if args.stt == "chirp" and not gcs_bucket:
         gcs_bucket = input("GCS bucket for STT staging: ").strip()
     stt_endpoint = keys.get("azSttEndpoint") or f"https://{az_region}.api.cognitive.microsoft.com"
+    claude_key = keys.get("cApi")
+    if not claude_key:
+        print("key.json must contain 'cApi' (Claude API key).", file=sys.stderr)
+        sys.exit(1)
 
     gc_path = Path(args.gc).resolve()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(gc_path)
@@ -195,7 +161,7 @@ def main():
         sys.exit(1)
 
     # ── 1. Download ─────────────────────────────────────────────────────────
-    print("\n[1/7] download")
+    print("\n[1/6] download")
     mp3_path = download_youtube(url, inputs_dir)
     stem = sanitize_stem(mp3_path.stem)
     print(f"  → {mp3_path}")
@@ -207,6 +173,7 @@ def main():
     transcript_srt_path = inter_dir / "transcript.srt"
     transcript_txt_path = inter_dir / "transcript.txt"
     boundaries_json_path = inter_dir / "chunk_boundaries.json"
+    vocab_json_path = inter_dir / "vocab.json"
     vocab_tsv_path = inter_dir / "vocab.tsv"
     for stale in (tts_cache, chunks_cache):
         if stale.exists():
@@ -216,7 +183,7 @@ def main():
     chunk_target_ms = int(args.chunk_minutes * 60 * 1000)
 
     # ── 2. Transcribe (cached) ──────────────────────────────────────────────
-    print("\n[2/7] transcribe")
+    print("\n[2/6] transcribe")
     cached_rows: list[dict] = []
     boundaries: list[tuple[int, int]] | None = None
     if transcript_json_path.exists() and transcript_json_path.stat().st_size > 0:
@@ -295,53 +262,47 @@ def main():
 
     transcript_text = " ".join(s.text for s in sentences)
 
-    # ── 3. Tokenize + count ─────────────────────────────────────────────────
-    print("\n[3/7] tokenize")
-    tokens = tokenize(transcript_text)
-    counts = Counter(w for w, _ in tokens)
-    print(f"  → {sum(counts.values())} kept tokens, {len(counts)} unique")
-
-    # ── 4. Interactive vocab picker ─────────────────────────────────────────
-    print("\n[4/7] vocab")
-    try:
-        x = int(input("How many new words per round (X): ").strip() or "10")
-    except ValueError:
-        x = 10
-    known = load_known_words(KNOWN_PATH)
-    prompted: set[str] = set()
-    picked_most = pick_round("MOST occurring", counts, known, x, False, FRENCH_WORD_RE, KNOWN_PATH, prompted)
-    picked_least = pick_round("LEAST occurring", counts, known, x, True, FRENCH_WORD_RE, KNOWN_PATH, prompted)
-    new_words: dict[str, int] = {**picked_most, **picked_least}
-    print(f"\n  → {len(new_words)} total new words")
-    if not new_words:
-        print("No new words picked; nothing to synthesize. Exiting.")
+    # ── 3. Vocab extraction (Claude, cached) ────────────────────────────────
+    print("\n[3/6] vocab (Claude)")
+    vocab: list[dict] = []
+    if vocab_json_path.exists() and vocab_json_path.stat().st_size > 0:
+        try:
+            vocab = json.loads(vocab_json_path.read_text(encoding="utf-8"))
+            print(f"  cached: {vocab_json_path.name} ({len(vocab)} items)")
+        except json.JSONDecodeError:
+            vocab = []
+    if not vocab:
+        vocab = extract_vocab(
+            transcript_text,
+            claude_key,
+            native_voice=FRENCH.native_voice,
+            break_ms=INTRA_GROUP_BREAK_MS,
+            extra_field=FRENCH.vocab_extra_field,
+            extra_explain=FRENCH.vocab_extra_explain,
+        )
+        vocab_json_path.write_text(
+            json.dumps(vocab, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"  → {len(vocab)} vocab items → {vocab_json_path.name}")
+    if not vocab:
+        print("Claude returned no vocab items; nothing to synthesize. Exiting.")
         sys.exit(0)
 
-    # ── 5. Enrich (per-word + per-sentence translation) ─────────────────────
-    print("\n[5/7] enrich (translate words + sentences)")
-    words_list = list(new_words.keys())
-    try:
-        word_meanings = translate_batch(words_list, project_id, FRENCH.translate_source)
-    except Exception as e:
-        print(f"  (word translate failed: {e})", file=sys.stderr)
-        word_meanings = {w: "" for w in words_list}
+    # vocab.tsv: text, [extra field], longExplain, shortExplain
+    with open(vocab_tsv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="\t", lineterminator="\n")
+        for v in vocab:
+            row = [v.get("text", "")]
+            if FRENCH.vocab_extra_field:
+                row.append(v.get(FRENCH.vocab_extra_field, ""))
+            row += [v.get("longExplain", ""), v.get("shortExplain", "")]
+            writer.writerow(row)
+    print(f"  → wrote {vocab_tsv_path.name}")
 
-    # Identify which sentences contain ≥1 new word (preserve order of new words in sentence)
-    new_word_set = set(words_list)
-    sentence_new_words: dict[int, list[str]] = {}
-    for idx, s in enumerate(sentences):
-        seen: list[str] = []
-        for w, _ in tokenize(s.text):
-            if w in new_word_set and w not in seen:
-                seen.append(w)
-        if seen:
-            sentence_new_words[idx] = seen
-    print(f"  → {len(sentence_new_words)} sentences contain ≥1 new word")
-
-    if not sentence_new_words:
-        print("None of the picked words appear in sentence-level tokens; aborting.")
-        sys.exit(0)
-
+    # ── 4. Sentence translation (for playback pairs) ────────────────────────
+    print("\n[4/6] translate sentences")
+    vocab_by_sentence = assign_vocab_to_sentences(vocab, sentences)
+    print(f"  → {len(vocab_by_sentence)} sentences contain ≥1 vocab item")
     all_sentence_texts = list({s.text for s in sentences})
     print(f"  → translating {len(all_sentence_texts)} sentence(s)")
     try:
@@ -352,14 +313,8 @@ def main():
         print(f"  (sentence translate failed: {e})", file=sys.stderr)
         sentence_translations_raw = {}
 
-    with open(vocab_tsv_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f, delimiter="\t", lineterminator="\n")
-        for w in words_list:
-            writer.writerow([w, word_meanings.get(w, ""), new_words[w]])
-    print(f"  → wrote {vocab_tsv_path.name}")
-
-    # ── 6. Load source audio + chunk ────────────────────────────────────────
-    print("\n[6/7] chunk audio")
+    # ── 5. Load source audio + chunk ────────────────────────────────────────
+    print("\n[5/6] chunk audio")
     print(f"  → loading {mp3_path.name}")
     original_audio = AudioSegment.from_mp3(str(mp3_path))
     if boundaries:
@@ -369,17 +324,16 @@ def main():
         chunks = chunk_sentences(sentences, target_ms=chunk_target_ms)
         print(f"  → {len(chunks)} chunks (target {args.chunk_minutes:.1f} min each)")
 
-    # ── 7. Build explanation clips, assemble chunks, concat ─────────────────
-    print("\n[7/7] synth + assemble")
+    # ── 6. Build explanation clips, assemble chunks, concat ─────────────────
+    print("\n[6/6] synth + assemble")
     sentence_index: dict[int, int] = {id(s): idx for idx, s in enumerate(sentences)}
     explanations: dict[int, AudioSegment] = {}
-    for n, (idx, nws) in enumerate(sentence_new_words.items(), 1):
+    for n, (idx, items) in enumerate(vocab_by_sentence.items(), 1):
         s = sentences[idx]
         translation = sentence_translations_raw.get(s.text, "")
         explanations[idx] = build_explanation_clip(
             sentence=s,
-            new_words_in_order=nws,
-            word_meanings=word_meanings,
+            vocab_ssml_in_order=[it.get("longExplainSsml", "") for it in items],
             sentence_translation=translation,
             original_audio=original_audio,
             tts_cache=tts_cache,
@@ -387,8 +341,8 @@ def main():
             az_region=az_region,
             cfg=FRENCH,
         )
-        if n % 5 == 0 or n == len(sentence_new_words):
-            print(f"  expl [{n}/{len(sentence_new_words)}]")
+        if n % 5 == 0 or n == len(vocab_by_sentence):
+            print(f"  expl [{n}/{len(vocab_by_sentence)}]")
 
     total_chunks = len(chunks)
 
