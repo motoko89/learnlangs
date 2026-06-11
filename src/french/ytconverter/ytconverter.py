@@ -35,7 +35,8 @@ Credentials (next to this script):
                                        e.g. https://<resource>.cognitiveservices.azure.com;
                                        optional, else derived from azSpeechRegion>",
                     "gcsBucket": "<GCS bucket for STT staging (default Chirp path)>",
-                    "cApi": "<OpenAI API key for vocab extraction>"}
+                    "cApi": "<OpenAI API key for vocab extraction>",
+                    "cApiBaseUrl": "<Azure OpenAI base URL for vocab extraction>"}
   jumeau-gc.json - Google Cloud service account JSON (used for Chirp STT + Translate v3)
 
 Dependencies:
@@ -150,6 +151,10 @@ def main():
     ai_key = keys.get("cApi")
     if not ai_key:
         print("key.json must contain 'cApi' (OpenAI API key).", file=sys.stderr)
+        sys.exit(1)
+    ai_base_url = keys.get("cApiBaseUrl")
+    if not ai_base_url:
+        print("key.json must contain 'cApiBaseUrl' (Azure OpenAI base URL).", file=sys.stderr)
         sys.exit(1)
 
     gc_path = Path(args.gc).resolve()
@@ -277,6 +282,7 @@ def main():
         vocab = extract_vocab(
             transcript_text,
             ai_key,
+            ai_base_url,
             native_voice=FRENCH.native_voice,
             break_ms=INTRA_GROUP_BREAK_MS,
             vocab_number=args.vocab_number,

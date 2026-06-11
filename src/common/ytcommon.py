@@ -528,7 +528,6 @@ def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
 
 VOCAB_MODEL = "gpt-5.4"
 VOCAB_SYSTEM = "Act as language learning API"
-AZURE_OPENAI_BASE_URL = "https://ai-learnlangs-foundry.services.ai.azure.com/openai/v1"
 
 
 def _vocab_prompt(
@@ -568,6 +567,7 @@ def _vocab_prompt(
 def extract_vocab(
     transcript_text: str,
     api_key: str,
+    base_url: str,
     native_voice: str,
     break_ms: int,
     vocab_number: int = 40,
@@ -582,7 +582,7 @@ def extract_vocab(
     from openai import OpenAI
 
     prompt = _vocab_prompt(vocab_number, native_voice, break_ms, extra_field, extra_explain)
-    client = OpenAI(base_url=AZURE_OPENAI_BASE_URL, api_key=api_key)
+    client = OpenAI(base_url=base_url, api_key=api_key)
     response = client.chat.completions.create(
         model=model,
         reasoning_effort="high",
