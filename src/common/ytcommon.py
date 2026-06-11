@@ -558,7 +558,11 @@ def _vocab_prompt(
         f"{native_voice} for the foreign language. Switching between languages will "
         f"have a break of {break_ms} ms; every <break> must be placed inside a "
         "<voice> element (e.g. inside the preceding voice's <prosody>), never as a "
-        'direct child of <speak>. "longExplain" is plain text version of '
+        "direct child of <speak>. The SSML must be well-formed XML: every tag has "
+        "exactly one matching closing tag, tags are properly nested, and there are "
+        "no stray or duplicate closing tags (e.g. never emit </voice></voice>); "
+        "<voice> elements are never nested. End the document with a single "
+        '</speak>. "longExplain" is plain text version of '
         '"longExplainSsml". "shortExplain" is just short English translation. Do not repeat "text" at the beginning of "longExplainSsml" and "longExplain". Do not start with "this is" at the beginning of "longExplainSsml" and "longExplain", go straight to explaining'
         f"{param4} No other response needed"
     )
