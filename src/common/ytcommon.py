@@ -720,9 +720,18 @@ def chunk_sentences(sentences: list[Sentence], target_ms: int) -> list[Chunk]:
 # break to just inside the preceding </voice> so it remains a valid pause.
 _ROOT_BREAK_AFTER_VOICE_RE = re.compile(r"</voice>\s*(<break\b[^>]*/>)")
 
+# LLM-generated SSML occasionally emits a stray duplicate </voice> before
+# </speak> (e.g. "...</prosody></voice></voice></speak>"). Azure rejects this
+# with error 1007 ("The 'speak' start tag ... does not match the end tag of
+# 'voice'"). <voice> can never be nested, so any run of consecutive closing
+# </voice> tags is always wrong — collapse it to a single one.
+_DUP_CLOSE_VOICE_RE = re.compile(r"</voice>(\s*</voice>)+")
+
 
 def sanitize_ssml(ssml: str) -> str:
-    return _ROOT_BREAK_AFTER_VOICE_RE.sub(r"\1</voice>", ssml)
+    ssml = _ROOT_BREAK_AFTER_VOICE_RE.sub(r"\1</voice>", ssml)
+    ssml = _DUP_CLOSE_VOICE_RE.sub("</voice>", ssml)
+    return ssml
 
 
 def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> AudioSegment:
@@ -748,7 +757,9 @@ def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> Audio
             if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
                 details = getattr(result, "cancellation_details", None)
                 err = details.error_details if details else "unknown"
-                raise RuntimeError(f"Azure TTS failed: {result.reason} / {err}")
+                raise RuntimeError(
+                    f"Azure TTS failed: {result.reason} / {err}\nSSML was:\n{ssml}"
+                )
             os.replace(tmp_path, out_path)
         finally:
             try:
