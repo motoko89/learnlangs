@@ -59,19 +59,26 @@ from .ytcommon import (
 def run_pipeline(
     cfg: LangConfig,
     script_dir: Path,
+    *,
+    downloader: Callable[[str, Path], Path] = download_youtube,
+    url_label: str = "YouTube URL",
     word_postprocess: Callable[[list[WordRec]], list[WordRec]] | None = None,
     description: str | None = None,
 ) -> None:
-    """Run the full YouTube → study-MP3 pipeline for one target language.
+    """Run the full <source> → study-MP3 pipeline for one target language.
 
     `cfg` carries every language-specific setting (voices, language codes, vocab
     params, album tag). `script_dir` locates the per-language key.json /
-    jumeau-gc.json defaults. `word_postprocess`, if given, maps the raw STT word
-    records before sentence segmentation (e.g. Mandarin's OpenCC s2tw).
-    `description` is shown in --help (the caller's module docstring)."""
+    jumeau-gc.json defaults. `downloader` resolves the input `url` to a local MP3
+    (default: YouTube via yt-dlp; the Apple Podcasts converter passes
+    :func:`common.applepodcast.download_apple_podcast`), and `url_label` is the
+    human label for that URL in --help / the prompt. `word_postprocess`, if given,
+    maps the raw STT word records before sentence segmentation (e.g. Mandarin's
+    OpenCC s2tw). `description` is shown in --help (the caller's module
+    docstring)."""
     parser = argparse.ArgumentParser(description=description,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("url", nargs="?", help="YouTube URL (prompted if omitted)")
+    parser.add_argument("url", nargs="?", help=f"{url_label} (prompted if omitted)")
     parser.add_argument("--keys", default=str(script_dir / "key.json"))
     parser.add_argument("--gc", default=str(script_dir / "jumeau-gc.json"))
     parser.add_argument("--gcs-bucket", help="GCS bucket for STT staging (else read from key.json:gcsBucket)")
@@ -119,14 +126,14 @@ def run_pipeline(
     with open(gc_path, encoding="utf-8") as f:
         project_id = json.load(f)["project_id"]
 
-    url = args.url or input("YouTube URL: ").strip()
+    url = args.url or input(f"{url_label}: ").strip()
     if not url:
         print("No URL provided.", file=sys.stderr)
         sys.exit(1)
 
     # ── 1. Download ─────────────────────────────────────────────────────────
     print("\n[1/6] download")
-    mp3_path = download_youtube(url, inputs_dir)
+    mp3_path = downloader(url, inputs_dir)
     stem = sanitize_stem(mp3_path.stem)
     print(f"  → {mp3_path}")
 

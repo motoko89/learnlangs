@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""French YouTube → Vocab Listening-Practice Generator.
+"""French Apple Podcast → Vocab Listening-Practice Generator.
 
 End-to-end pipeline:
-  1. Prompt for a YouTube URL.
-  2. Download audio (yt-dlp -x mp3) into ./inputs/.
+  1. Prompt for an Apple Podcast episode URL
+     (e.g. https://podcasts.apple.com/us/podcast/<slug>/id<showId>?i=<episodeId>).
+  2. Resolve the episode's audio via Apple's official iTunes Lookup API (match the
+     episode by exact trackId == the `i=` value → direct CDN episodeUrl) and
+     download it (yt-dlp -x mp3) into ./inputs/. Falls back to yt-dlp's
+     ApplePodcasts extractor when the episode predates the lookup window.
   3. Transcribe with Google Chirp 3 (default; pass --stt mai for Azure
      MAI-Transcribe-1.5), with word-level timestamps. Cache JSON.
   4. Extract the top-N vocab words/phrases (N = --vocab-number, default 40) with
@@ -20,9 +24,10 @@ End-to-end pipeline:
      and concatenate all chunks (2s between chunks) into outputs/<stem>.mp3.
 
 The language-agnostic pipeline lives in src/common/ytpipeline.py (orchestration)
-and src/common/ytcommon.py (library helpers); the French-specific pieces
-(language codes, the OpenAI vocab params, and the voices) live in
-src/french/common/langconfig.py, shared with the Apple Podcast converter.
+and src/common/ytcommon.py (library helpers); Apple-podcast download lives in
+src/common/applepodcast.py; the French-specific pieces (language codes, the
+OpenAI vocab params, and the voices) live in src/french/common/langconfig.py,
+shared with the YouTube converter.
 
 I/O folders (created at invocation cwd):
   inputs/                 - downloaded MP3
@@ -43,7 +48,7 @@ Credentials (next to this script):
 Dependencies:
   pip install -r requirements.txt
   brew install ffmpeg   # pydub MP3 decode; also used by yt-dlp
-  python3 ytconverter.py
+  python3 applepodcastconverter.py
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from pathlib import Path
 # Make src/ importable so `from common.ytpipeline import ...` works when the
 # script is run directly from this directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from common.applepodcast import download_apple_podcast  # noqa: E402
 from common.ytpipeline import run_pipeline  # noqa: E402
 from french.common.langconfig import FRENCH  # noqa: E402
 
@@ -61,7 +67,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def main():
-    run_pipeline(FRENCH, SCRIPT_DIR, description=__doc__)
+    run_pipeline(
+        FRENCH,
+        SCRIPT_DIR,
+        downloader=download_apple_podcast,
+        url_label="Apple Podcast episode URL",
+        description=__doc__,
+    )
 
 
 if __name__ == "__main__":

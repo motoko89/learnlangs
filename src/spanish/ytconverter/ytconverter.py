@@ -20,8 +20,9 @@ End-to-end pipeline:
      and concatenate all chunks (2s between chunks) into outputs/<stem>.mp3.
 
 The language-agnostic pipeline lives in src/common/ytpipeline.py (orchestration)
-and src/common/ytcommon.py (library helpers); this script only carries the
-Spanish-specific pieces (language codes, the OpenAI vocab params, and the voices).
+and src/common/ytcommon.py (library helpers); the Spanish-specific pieces
+(language codes, the OpenAI vocab params, and the voices) live in
+src/spanish/common/langconfig.py, shared with the Apple Podcast converter.
 
 I/O folders (created at invocation cwd):
   inputs/                 - downloaded MP3
@@ -53,28 +54,10 @@ from pathlib import Path
 # Make src/ importable so `from common.ytpipeline import ...` works when the
 # script is run directly from this directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from common.ytcommon import LangConfig  # noqa: E402
 from common.ytpipeline import run_pipeline  # noqa: E402
+from spanish.common.langconfig import SPANISH  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-
-SPANISH = LangConfig(
-    native_voice="es-MX-Tristan:DragonHDLatestNeural",
-    en_voice="en-US-AvaNeural",
-    tts_rate="0.9",
-    xml_lang="es-MX",
-    language_code="es-US",
-    chirp_location="us",
-    chirp_model="chirp_3",
-    mai_locale="es",
-    sentence_end_chars=".!?…",
-    sub_sentence_break_chars=",;:",
-    word_joiner=" ",
-    translate_source="es",
-    vocab_extra_field="",
-    vocab_extra_explain="",
-    album="LearnLangs Spanish",
-)
 
 
 def main():

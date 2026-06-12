@@ -94,10 +94,16 @@ def sanitize_stem(stem: str) -> str:
 
 # ─── yt-dlp download ──────────────────────────────────────────────────────────
 
-def download_youtube(url: str, inputs_dir: Path) -> Path:
-    """Run yt-dlp and return the path to the downloaded MP3."""
+def ytdlp_download(url: str, inputs_dir: Path, title: str | None = None) -> Path:
+    """Run yt-dlp (extract audio → MP3) and return the downloaded file's path.
+
+    Works for any yt-dlp-supported URL (YouTube, a direct media URL, an Apple
+    Podcasts page, ...). When `title` is given it is used verbatim as the output
+    filename stem (the caller is responsible for sanitizing it); otherwise the
+    extractor's own ``%(title)s`` is used."""
     ensure_dirs(inputs_dir)
-    output_template = str(inputs_dir / "%(title)s.%(ext)s")
+    name_template = f"{title}.%(ext)s" if title else "%(title)s.%(ext)s"
+    output_template = str(inputs_dir / name_template)
     cmd = [
         "yt-dlp",
         "-f", "bestaudio",
@@ -115,6 +121,11 @@ def download_youtube(url: str, inputs_dir: Path) -> Path:
     if not paths:
         raise RuntimeError(f"yt-dlp did not report an output filepath. stderr:\n{result.stderr}")
     return Path(paths[-1]).resolve()
+
+
+def download_youtube(url: str, inputs_dir: Path) -> Path:
+    """Run yt-dlp and return the path to the downloaded MP3."""
+    return ytdlp_download(url, inputs_dir)
 
 
 # ─── Audio convert + GCS upload ───────────────────────────────────────────────
@@ -756,12 +767,30 @@ def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> Audio
             speech_config.set_speech_synthesis_output_format(
                 speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3
             )
-            audio_config = speechsdk.audio.AudioOutputConfig(filename=str(tmp_path))
-            synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
-            result = synthesizer.speak_ssml_async(ssml).get()
-            if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+            # The service decides a request that is too slow (RTF/frame-interval
+            # threshold) and cancels it — transient and retryable. Bad SSML, by
+            # contrast, is cancelled with a definite error code and never recovers.
+            # Retry the former with backoff; surface the latter immediately.
+            transient_codes = {
+                speechsdk.CancellationErrorCode.ServiceTimeout,
+                speechsdk.CancellationErrorCode.ServiceUnavailable,
+                speechsdk.CancellationErrorCode.ConnectionFailure,
+                speechsdk.CancellationErrorCode.ServiceError,
+                speechsdk.CancellationErrorCode.RuntimeError,
+            }
+            max_attempts = 4
+            for attempt in range(1, max_attempts + 1):
+                audio_config = speechsdk.audio.AudioOutputConfig(filename=str(tmp_path))
+                synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+                result = synthesizer.speak_ssml_async(ssml).get()
+                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                    break
                 details = getattr(result, "cancellation_details", None)
                 err = details.error_details if details else "unknown"
+                code = details.error_code if details else None
+                if code in transient_codes and attempt < max_attempts:
+                    time.sleep(2 ** (attempt - 1))
+                    continue
                 raise RuntimeError(
                     f"Azure TTS failed: {result.reason} / {err}\nSSML was:\n{ssml}"
                 )

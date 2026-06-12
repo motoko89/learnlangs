@@ -21,9 +21,9 @@ End-to-end pipeline:
      and concatenate all chunks (2s between chunks) into outputs/<stem>.mp3.
 
 The language-agnostic pipeline lives in src/common/ytpipeline.py (orchestration)
-and src/common/ytcommon.py (library helpers); this script only carries the
-Mandarin-specific pieces (OpenCC s2tw conversion, the OpenAI vocab params, and
-the voices).
+and src/common/ytcommon.py (library helpers); the Mandarin-specific pieces
+(OpenCC s2tw conversion, the OpenAI vocab params, and the voices) live in
+src/mandarin/common/langconfig.py, shared with the Apple Podcast converter.
 
 I/O folders (created at invocation cwd):
   inputs/                 - downloaded MP3
@@ -55,52 +55,14 @@ from pathlib import Path
 # Make src/ importable so `from common.ytpipeline import ...` works when the
 # script is run directly from this directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from common.ytcommon import LangConfig, WordRec  # noqa: E402
 from common.ytpipeline import run_pipeline  # noqa: E402
+from mandarin.common.langconfig import MANDARIN, mandarin_word_postprocess  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-MANDARIN = LangConfig(
-    native_voice="zh-TW-YunJheNeural",
-    en_voice="en-US-AvaNeural",
-    tts_rate="0.9",
-    xml_lang="zh-TW",
-    language_code="cmn-Hans-CN",
-    chirp_location="us",
-    chirp_model="chirp_3",
-    mai_locale="zh",
-    sentence_end_chars="。！？!?.",
-    sub_sentence_break_chars="，,、；;：:",
-    word_joiner="",
-    translate_source="zh-TW",
-    vocab_extra_field="pinyin",
-    vocab_extra_explain='"pinyin" is the Hanyu Pinyin romanization (with tone marks) of "text".',
-    album="LearnLangs Mandarin",
-)
-
-
-# ─── OpenCC s2tw (Simplified → Traditional Taiwan) ────────────────────────────
-
-_S2T_CONVERTER = None
-
-
-def s2t(text: str) -> str:
-    global _S2T_CONVERTER
-    if _S2T_CONVERTER is None:
-        from opencc import OpenCC
-        _S2T_CONVERTER = OpenCC("s2tw")
-    return _S2T_CONVERTER.convert(text)
-
-
-def _s2t_words(words: list[WordRec]) -> list[WordRec]:
-    return [
-        WordRec(word=s2t(w.word), start_ms=w.start_ms, end_ms=w.end_ms, speaker=w.speaker)
-        for w in words
-    ]
-
 
 def main():
-    run_pipeline(MANDARIN, SCRIPT_DIR, word_postprocess=_s2t_words, description=__doc__)
+    run_pipeline(MANDARIN, SCRIPT_DIR, word_postprocess=mandarin_word_postprocess, description=__doc__)
 
 
 if __name__ == "__main__":

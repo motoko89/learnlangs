@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Spanish :class:`LangConfig`, shared by the Spanish ytconverter and
+applepodcastconverter scripts (voices, language codes, the OpenAI vocab params)."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Make src/ importable so `from common.ytcommon import ...` works when imported
+# from a sibling per-language script run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from common.ytcommon import LangConfig  # noqa: E402
+
+SPANISH = LangConfig(
+    native_voice="es-MX-Tristan:DragonHDLatestNeural",
+    en_voice="en-US-AvaNeural",
+    tts_rate="0.9",
+    xml_lang="es-MX",
+    language_code="es-US",
+    chirp_location="us",
+    chirp_model="chirp_3",
+    mai_locale="es",
+    sentence_end_chars=".!?…",
+    sub_sentence_break_chars=",;:",
+    word_joiner=" ",
+    translate_source="es",
+    vocab_extra_field="",
+    vocab_extra_explain="",
+    album="LearnLangs Spanish",
+)
