@@ -71,6 +71,7 @@ class LangConfig:
     translate_source: str       # Cloud Translate source code, e.g. "zh-TW" / "fr"
     vocab_extra_field: str = ""     # extra OpenAI JSON property name, e.g. "pinyin" ("" if none)
     vocab_extra_explain: str = ""   # sentence describing the extra property ("" if none)
+    album: str = ""                 # ID3 album tag for the final MP3, e.g. "LearnLangs French"
 
 
 # ─── Bootstrap / config ───────────────────────────────────────────────────────
