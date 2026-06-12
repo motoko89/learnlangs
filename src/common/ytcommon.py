@@ -620,13 +620,16 @@ def build_vocab_ssml_by_sentence(
 ) -> dict[int, list[str]]:
     """Resolve the per-sentence vocab explanation SSML, in playback order.
 
-    A vocab item is cued in every sentence whose text contains its 'text'. The
-    first time a 'text' appears (scanning sentences in time order) it gets its
-    full ``longExplainSsml``; every later sentence it reappears in gets a short
-    English-only clip built from ``shortExplain``. Returns
-    {sentence_idx: [ssml, ...]} for sentences with ≥1 cue (vocab order within a
-    sentence). Items whose text never appears verbatim are skipped (still kept
-    in vocab.json/tsv)."""
+    A vocab item is cued in every sentence whose text contains its 'text'. Each
+    cue plays the word itself (foreign voice) and then its explanation, so two
+    SSML docs are emitted per cue: ``ssml_native_word(text)`` followed by the
+    explanation. The first time a 'text' appears (scanning sentences in time
+    order) the explanation is its full ``longExplainSsml``; every later sentence
+    it reappears in gets a short English-only clip built from ``shortExplain``.
+    Returns {sentence_idx: [ssml, ...]} for sentences with ≥1 cue (vocab order
+    within a sentence; rendered in order with breaks by
+    :func:`build_explanation_clip`). Items whose text never appears verbatim are
+    skipped (still kept in vocab.json/tsv)."""
     seen: set[str] = set()
     by_sentence: dict[int, list[str]] = {}
     for idx, s in enumerate(sentences):
@@ -636,11 +639,13 @@ def build_vocab_ssml_by_sentence(
                 continue
             if text not in seen:
                 seen.add(text)
-                ssml = v.get("longExplainSsml", "")
+                explain = v.get("longExplainSsml", "")
             else:
-                ssml = ssml_short_explain(v.get("shortExplain", ""), cfg)
-            if ssml:
-                by_sentence.setdefault(idx, []).append(ssml)
+                explain = ssml_short_explain(v.get("shortExplain", ""), cfg)
+            if explain:
+                by_sentence.setdefault(idx, []).extend(
+                    [ssml_native_word(text, cfg), explain]
+                )
     return by_sentence
 
 
@@ -838,6 +843,12 @@ def ssml_short_explain(short_text: str, cfg: LangConfig) -> str:
     )
 
 
+def ssml_native_word(text: str, cfg: LangConfig) -> str:
+    """The vocab word/phrase itself, spoken in the foreign voice. Played before
+    each explanation so the learner hears the term first, then the breakdown."""
+    return _wrap_ssml(_voice(cfg.native_voice, text, cfg.tts_rate), cfg.xml_lang)
+
+
 def ssml_chunk_announcement(idx: int, total: int, cfg: LangConfig) -> str:
     return _wrap_ssml(_voice(cfg.en_voice, f"Explaining part {idx} of {total}.", cfg.tts_rate), cfg.xml_lang)
 
@@ -869,11 +880,12 @@ def build_explanation_clip(
     az_region: str,
     cfg: LangConfig,
 ) -> AudioSegment:
-    """Per-sentence clip for sentences containing ≥1 new vocab item:
-    OpenAI's per-vocab SSML explanations + original_slice + EN/native sentence
-    pair + original_slice, with 500 ms breaks. Each entry of
-    vocab_ssml_in_order is a full Azure SSML document (the item's
-    ``longExplainSsml``) rendered directly."""
+    """Per-sentence clip for sentences containing ≥1 vocab cue:
+    per-vocab SSML (the word in the foreign voice, then its explanation) +
+    original_slice + EN/native sentence pair + original_slice, with 500 ms
+    breaks. Each entry of vocab_ssml_in_order is a full Azure SSML document
+    rendered directly; cues arrive as word/explanation pairs from
+    :func:`build_vocab_ssml_by_sentence`."""
     gap = AudioSegment.silent(duration=INTRA_GROUP_BREAK_MS)
     clip_a = AudioSegment.silent(duration=0)
     for i, ssml in enumerate(s for s in vocab_ssml_in_order if s):
