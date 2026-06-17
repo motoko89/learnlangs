@@ -15,7 +15,7 @@ from common.ytcommon import LangConfig, WordRec  # noqa: E402
 
 MANDARIN = LangConfig(
     native_voice="zh-TW-YunJheNeural",
-    en_voice="en-US-AvaNeural",
+    en_voice="en-US-Ava:DragonHDLatestNeural",
     tts_rate="0.9",
     xml_lang="zh-TW",
     language_code="cmn-Hans-CN",

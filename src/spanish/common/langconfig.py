@@ -14,7 +14,7 @@ from common.ytcommon import LangConfig  # noqa: E402
 
 SPANISH = LangConfig(
     native_voice="es-MX-Tristan:DragonHDLatestNeural",
-    en_voice="en-US-AvaNeural",
+    en_voice="en-US-Ava:DragonHDLatestNeural",
     tts_rate="0.9",
     xml_lang="es-MX",
     language_code="es-US",

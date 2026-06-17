@@ -14,7 +14,7 @@ from common.ytcommon import LangConfig  # noqa: E402
 
 FRENCH = LangConfig(
     native_voice="fr-FR-Remy:DragonHDLatestNeural",
-    en_voice="en-US-AvaNeural",
+    en_voice="en-US-Ava:DragonHDLatestNeural",
     tts_rate="0.9",
     xml_lang="fr-FR",
     language_code="fr-FR",
