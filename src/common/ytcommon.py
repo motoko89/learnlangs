@@ -363,11 +363,24 @@ class Sentence:
 
 
 def _join_words(words: list[WordRec], joiner: str) -> str:
-    text = joiner.join(x.word for x in words).strip()
     if joiner:
-        # Space-delimited language: drop whitespace inserted before punctuation.
-        text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
-    return text
+        # Space-delimited language: join with the configured joiner, then drop
+        # whitespace inserted before punctuation.
+        text = joiner.join(x.word for x in words).strip()
+        return _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
+    # No-joiner language (e.g. Chinese): concatenate directly, but keep a space
+    # between two adjacent ASCII tokens so embedded Latin-script words/numbers
+    # (e.g. "machine" + "learning", "iPhone" + "15") aren't mashed together.
+    parts: list[str] = []
+    prev_ascii = False
+    for x in words:
+        cur_ascii = bool(x.word) and x.word.isascii()
+        if parts and prev_ascii and cur_ascii:
+            parts.append(" ")
+        parts.append(x.word)
+        prev_ascii = cur_ascii
+    text = "".join(parts).strip()
+    return _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
 
 
 def _sentence_from_words(buf: list[WordRec], joiner: str) -> Sentence:
