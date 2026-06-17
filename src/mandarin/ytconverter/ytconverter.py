@@ -44,7 +44,7 @@ Credentials (next to this script):
 Dependencies:
   pip install -r requirements.txt
   brew install ffmpeg   # pydub MP3 decode; also used by yt-dlp
-  python3 ytconverter.py
+  python3 ytconverter.py  --min-speakers 1 --chunk-minutes 4 --max-speakers 4 --workers 4 --vocab-number 20
 """
 
 from __future__ import annotations
