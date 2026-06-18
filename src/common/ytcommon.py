@@ -556,13 +556,20 @@ VOCAB_SYSTEM = "Act as language learning API"
 
 
 def _vocab_prompt(
-    count: int, native_voice: str, break_ms: int, extra_field: str, extra_explain: str
+    count: int,
+    native_voice: str,
+    en_voice: str,
+    tts_rate: str,
+    break_ms: int,
+    extra_field: str,
+    extra_explain: str,
 ) -> str:
     """Build the message from the fixed template, substituting the five params.
 
     PARAM1 = the extra JSON property (e.g. "pinyin"), PARAM2 = the foreign-language
     Azure voice, PARAM3 = the inter-language break in ms, PARAM4 = the sentence
     describing the extra property, PARAM5 = how many words/phrases to extract.
+    en_voice and tts_rate are the English Azure voice and the SSML prosody rate.
     Empty extra_field/extra_explain drop their clauses entirely (the "" if not
     needed case)."""
     param1 = f', "{extra_field}"' if extra_field else ""
@@ -579,7 +586,7 @@ def _vocab_prompt(
         f'"text", "longExplainSsml", "longExplain", "shortExplain"{param1}. "text" '
         'is the original text. "longExplainSsml" is the explanation of the text in '
         "the context of the transcript, its format is Azure Speech-to-Text SSML. "
-        "Rate will be 0.9. Voice name is en-US-AvaNeural for English, "
+        f"Rate will be {tts_rate}. Voice name is {en_voice} for English, "
         f"{native_voice} for the foreign language. Switching between languages will "
         f"have a break of {break_ms} ms; every <break> must be placed inside a "
         "<voice> element (e.g. inside the preceding voice's <prosody>), never as a "
@@ -598,6 +605,8 @@ def extract_vocab(
     api_key: str,
     base_url: str,
     native_voice: str,
+    en_voice: str,
+    tts_rate: str,
     break_ms: int,
     vocab_number: int = 40,
     extra_field: str = "",
@@ -610,7 +619,9 @@ def extract_vocab(
     'pinyin')."""
     from openai import OpenAI
 
-    prompt = _vocab_prompt(vocab_number, native_voice, break_ms, extra_field, extra_explain)
+    prompt = _vocab_prompt(
+        vocab_number, native_voice, en_voice, tts_rate, break_ms, extra_field, extra_explain
+    )
     client = OpenAI(base_url=base_url, api_key=api_key)
     response = client.chat.completions.create(
         model=model,

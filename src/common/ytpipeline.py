@@ -249,6 +249,8 @@ def run_pipeline(
             ai_key,
             ai_base_url,
             native_voice=cfg.native_voice,
+            en_voice=cfg.en_voice,
+            tts_rate=cfg.tts_rate,
             break_ms=INTRA_GROUP_BREAK_MS,
             vocab_number=args.vocab_number,
             extra_field=cfg.vocab_extra_field,
