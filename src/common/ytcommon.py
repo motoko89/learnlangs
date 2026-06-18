@@ -577,11 +577,11 @@ def _vocab_prompt(
     return (
         f"Identify exactly top {count} words or phrases in the attached transcript that "
         "will help an intermediate language learner understand this conversation. "
-        "Focus on: key words/phrases that are crucial to understand the whole "
+        "Focus on: key upper-intermediate- and advanced-level words/phrases that are crucial to understand the "
         "conversation, rare words/phrases, words/phrases that are "
-        "upper-intermediate/advanced vocabulary, or daily expressions. For "
+        "upper-intermediate/advanced daily expressions. For "
         "non-Latin language, e.g. Mandarin, also include advanced, or obscured "
-        "private names of places, e.g. countries, cities. Output these "
+        "private names of places, e.g. countries, cities, private names. Output these "
         "words/phrases into a JSON array. Each JSON object has these properties: "
         f'"text", "longExplainSsml", "longExplain", "shortExplain"{param1}. "text" '
         'is the original text. "longExplainSsml" is the explanation of the text in '
@@ -595,7 +595,7 @@ def _vocab_prompt(
         "no stray or duplicate closing tags (e.g. never emit </voice></voice>); "
         "<voice> elements are never nested. End the document with a single "
         '</speak>. "longExplain" is plain text version of '
-        '"longExplainSsml". "shortExplain" is just short English translation. Do not repeat "text" at the beginning of "longExplainSsml" and "longExplain". Do not start with "this is" at the beginning of "longExplainSsml" and "longExplain", go straight to explaining'
+        '"longExplainSsml". Long explains must be 200 characters long maximum in plain text, keep them succinct. Prioritize English explanation for long explain. "shortExplain" is just short English translation. Do not repeat "text" at the beginning of "longExplainSsml" and "longExplain". Do not start with "this is" at the beginning of "longExplainSsml" and "longExplain", go straight to explaining'
         f"{param4} No other response needed"
     )
 
