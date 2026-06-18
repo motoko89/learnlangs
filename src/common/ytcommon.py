@@ -241,7 +241,8 @@ def transcribe(
     POLL_TIMEOUT_S = 3600
 
     def _on_retry(exc: Exception) -> None:
-        print(f"  · transient {type(exc).__name__} ({exc}); backing off...", file=sys.stderr)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  · [{now}] transient {type(exc).__name__} ({exc}); backing off...", file=sys.stderr)
 
     retryable = garetry.if_exception_type(
         gexc.ResourceExhausted, gexc.ServiceUnavailable,
