@@ -207,6 +207,8 @@ def transcribe(
     """Chirp BatchRecognize across N files. files = [(gcs_uri, offset_ms), ...].
     Returns a flat list of word records, timestamps already offset and sorted."""
     from google.api_core.client_options import ClientOptions
+    from google.api_core import exceptions as gexc
+    from google.api_core import retry as garetry
     from google.cloud.speech_v2 import SpeechClient
     from google.cloud.speech_v2.types import cloud_speech
 
@@ -227,6 +229,51 @@ def transcribe(
             ),
         ),
     )
+    # api_core's operation.result() refreshes the LRO via the generic
+    # google.longrunning.Operations.GetOperation, which the backend bills to the
+    # *v1* operations quota and which the api_core poller hammers (sub-second
+    # initial backoff) — that is what 429s and aborts a run. Poll manually
+    # through the v2 client's own get_operation (it carries the routing header
+    # x-goog-request-params: name=projects/.../locations/<region>/operations/...,
+    # so it is billed to the v2 quota) at a fixed, gentle interval, and retry the
+    # transient 429s instead of crashing.
+    POLL_INTERVAL_S = 15
+    POLL_TIMEOUT_S = 3600
+
+    def _on_retry(exc: Exception) -> None:
+        print(f"  · transient {type(exc).__name__} ({exc}); backing off...", file=sys.stderr)
+
+    retryable = garetry.if_exception_type(
+        gexc.ResourceExhausted, gexc.ServiceUnavailable,
+        gexc.DeadlineExceeded, gexc.Aborted,
+    )
+    submit_retry = garetry.Retry(
+        predicate=retryable, initial=5.0, maximum=120.0, multiplier=2.0,
+        timeout=900.0, on_error=_on_retry,
+    )
+    poll_retry = garetry.Retry(
+        predicate=retryable, initial=5.0, maximum=60.0, multiplier=2.0,
+        timeout=300.0, on_error=_on_retry,
+    )
+
+    def _await_batch(op_name: str):
+        """Poll a BatchRecognize LRO through the v2 service until done and return
+        its BatchRecognizeResponse. GetOperation calls here bill the v2 quota."""
+        deadline = time.monotonic() + POLL_TIMEOUT_S
+        while True:
+            lro = client.get_operation(request={"name": op_name}, retry=poll_retry)
+            if lro.done:
+                if lro.error.code:
+                    raise RuntimeError(
+                        f"BatchRecognize failed: code={lro.error.code} {lro.error.message}"
+                    )
+                return cloud_speech.BatchRecognizeResponse.deserialize(lro.response.value)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"BatchRecognize operation did not finish within {POLL_TIMEOUT_S}s: {op_name}"
+                )
+            time.sleep(POLL_INTERVAL_S)
+
     words: list[WordRec] = []
     for i, (uri, offset) in enumerate(files, 1):
         request = cloud_speech.BatchRecognizeRequest(
@@ -238,8 +285,8 @@ def transcribe(
             ),
         )
         print(f"  → [{i}/{len(files)}] STT v2 ({model}) BatchRecognize submitted (+{offset}ms); waiting...")
-        operation = client.batch_recognize(request=request)
-        response = operation.result(timeout=3600)
+        operation = client.batch_recognize(request=request, retry=submit_retry)
+        response = _await_batch(operation.operation.name)
 
         for resp_uri, file_result in response.results.items():
             err = getattr(file_result, "error", None)
