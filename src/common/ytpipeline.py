@@ -271,7 +271,7 @@ def run_pipeline(
             row = [v.get("text", "")]
             if cfg.vocab_extra_field:
                 row.append(v.get(cfg.vocab_extra_field, ""))
-            row += [v.get("longExplain", ""), v.get("shortExplain", "")]
+            row += [v.get("shortExplain", "")]
             writer.writerow(row)
     print(f"  → wrote {vocab_tsv_path.name}")
 
