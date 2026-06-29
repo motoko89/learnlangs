@@ -259,7 +259,7 @@ def run_pipeline(
         print("OpenAI returned no vocab items; nothing to synthesize. Exiting.")
         sys.exit(0)
 
-    # vocab.tsv: text, [extra field], longExplain, shortExplain
+    # vocab.tsv: text, [extra field], shortExplain
     with open(vocab_tsv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter="\t", lineterminator="\n")
         for v in vocab:
