@@ -29,7 +29,6 @@ from pydub import AudioSegment
 
 from .ytcommon import (
     INTER_CHUNK_BREAK_MS,
-    INTRA_GROUP_BREAK_MS,
     Chunk,
     LangConfig,
     WordRec,
@@ -248,10 +247,6 @@ def run_pipeline(
             transcript_text,
             ai_key,
             ai_base_url,
-            native_voice=cfg.native_voice,
-            en_voice=cfg.en_voice,
-            tts_rate=cfg.tts_rate,
-            break_ms=INTRA_GROUP_BREAK_MS,
             vocab_number=args.vocab_number,
             extra_field=cfg.vocab_extra_field,
             extra_explain=cfg.vocab_extra_explain,

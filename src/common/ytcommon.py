@@ -608,14 +608,13 @@ def _vocab_prompt(
     extra_field: str,
     extra_explain: str,
 ) -> str:
-    """Build the message from the fixed template, substituting the five params.
+    """Build the message from the fixed template.
 
-    PARAM1 = the extra JSON property (e.g. "pinyin"), PARAM2 = the foreign-language
-    Azure voice, PARAM3 = the inter-language break in ms, PARAM4 = the sentence
-    describing the extra property, PARAM5 = how many words/phrases to extract.
-    en_voice and tts_rate are the English Azure voice and the SSML prosody rate.
-    Empty extra_field/extra_explain drop their clauses entirely (the "" if not
-    needed case)."""
+    ``count`` is how many words/phrases to extract; ``extra_field`` is the extra
+    JSON property (e.g. "pinyin") and ``extra_explain`` the sentence describing
+    it. Empty extra_field/extra_explain drop their clauses entirely (the "" if
+    not needed case). All explanations are plain text — no SSML is produced
+    here; the playback SSML is synthesized downstream."""
     param1 = f', "{extra_field}"' if extra_field else ""
     param4 = f" {extra_explain}" if extra_explain else ""
     return (
@@ -639,10 +638,6 @@ def extract_vocab(
     transcript_text: str,
     api_key: str,
     base_url: str,
-    native_voice: str,
-    en_voice: str,
-    tts_rate: str,
-    break_ms: int,
     vocab_number: int = 40,
     extra_field: str = "",
     extra_explain: str = "",
@@ -650,13 +645,12 @@ def extract_vocab(
 ) -> list[dict]:
     """Ask Azure OpenAI (high reasoning effort) for the top-`vocab_number` vocab
     items and return the parsed JSON array. Each item carries 'text',
-    'longExplainSsml', 'longExplain', 'shortExplain' (+ extra_field, e.g.
-    'pinyin')."""
+    'longExplain', 'shortExplain' (+ extra_field, e.g. 'pinyin'). 'longExplain'
+    and 'shortExplain' are plain English text; the playback SSML is synthesized
+    from them downstream (see :func:`build_vocab_ssml_by_sentence`)."""
     from openai import OpenAI
 
-    prompt = _vocab_prompt(
-        vocab_number, native_voice, en_voice, tts_rate, break_ms, extra_field, extra_explain
-    )
+    prompt = _vocab_prompt(vocab_number, extra_field, extra_explain)
     client = OpenAI(base_url=base_url, api_key=api_key)
     response = client.chat.completions.create(
         model=model,
@@ -683,8 +677,9 @@ def build_vocab_ssml_by_sentence(
     cue plays the word itself (foreign voice) and then its explanation, so two
     SSML docs are emitted per cue: ``ssml_native_word(text)`` followed by the
     explanation. The first time a 'text' appears (scanning sentences in time
-    order) the explanation is its full ``longExplainSsml``; every later sentence
-    it reappears in gets a short English-only clip built from ``shortExplain``.
+    order) the explanation is its full ``longExplain`` (English-only SSML built
+    by :func:`ssml_long_explain`); every later sentence it reappears in gets a
+    short English-only clip built from ``shortExplain``.
     Returns {sentence_idx: [ssml, ...]} for sentences with ≥1 cue (vocab order
     within a sentence; rendered in order with breaks by
     :func:`build_explanation_clip`). Items whose text never appears verbatim are
@@ -698,7 +693,7 @@ def build_vocab_ssml_by_sentence(
                 continue
             if text not in seen:
                 seen.add(text)
-                explain = v.get("longExplainSsml", "")
+                explain = ssml_long_explain(v.get("longExplain", ""), cfg)
             else:
                 explain = ssml_short_explain(v.get("shortExplain", ""), cfg)
             if explain:
@@ -891,6 +886,16 @@ def ssml_sentence_pair(en_text: str, native_text: str, cfg: LangConfig) -> str:
         + _voice(cfg.native_voice, native_text, cfg.tts_rate)
     )
     return _wrap_ssml(body, cfg.xml_lang)
+
+
+def ssml_long_explain(long_text: str, cfg: LangConfig) -> str:
+    """English-only SSML used the first time a vocab item appears: the full
+    English explanation in the EN voice (no foreign voice). Built from the
+    plain-text ``longExplain`` returned by :func:`extract_vocab`."""
+    return _wrap_ssml(
+        _voice(cfg.en_voice, long_text or "(no explanation)", cfg.tts_rate),
+        cfg.xml_lang,
+    )
 
 
 def ssml_short_explain(short_text: str, cfg: LangConfig) -> str:
