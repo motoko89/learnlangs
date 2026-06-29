@@ -32,10 +32,9 @@ from pydub import AudioSegment
 TARGET_SAMPLE_RATE = 16000
 TARGET_CHANNELS = 1
 
-INTRA_GROUP_BREAK_MS = 500
 INTER_PART_BREAK_MS = 1000
 INTER_CHUNK_BREAK_MS = 2000
-CHUNK_ANNOUNCEMENT_PAD_MS = 600
+CHUNK_ANNOUNCEMENT_PAD_MS = 900
 
 SILENCE_LEN_MS = 500
 SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
@@ -949,11 +948,11 @@ def build_explanation_clip(
 ) -> AudioSegment:
     """Per-sentence clip for sentences containing ≥1 vocab cue:
     per-vocab SSML (the word in the foreign voice, then its explanation) +
-    original_slice + EN sentence translation + original_slice, with 500 ms
+    original_slice + EN sentence translation + original_slice, with 2 s
     breaks. Each entry of vocab_ssml_in_order is a full Azure SSML document
     rendered directly; cues arrive as word/explanation pairs from
     :func:`build_vocab_ssml_by_sentence`."""
-    gap = AudioSegment.silent(duration=INTRA_GROUP_BREAK_MS)
+    gap = AudioSegment.silent(duration=INTER_CHUNK_BREAK_MS)
     clip_a = AudioSegment.silent(duration=0)
     for i, ssml in enumerate(s for s in vocab_ssml_in_order if s):
         if i:
