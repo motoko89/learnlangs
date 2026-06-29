@@ -36,7 +36,6 @@ INTRA_GROUP_BREAK_MS = 500
 INTER_PART_BREAK_MS = 1000
 INTER_CHUNK_BREAK_MS = 2000
 CHUNK_ANNOUNCEMENT_PAD_MS = 600
-NO_VOCAB_BREAK_MS = 600
 
 SILENCE_LEN_MS = 500
 SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
@@ -968,30 +967,6 @@ def build_explanation_clip(
     return clip_a + gap + original_slice + gap + clip_b + gap + original_slice
 
 
-def build_no_vocab_clip(
-    sentence: Sentence,
-    sentence_translation: str,
-    original_audio: AudioSegment,
-    tts_cache: Path,
-    az_key: str,
-    az_region: str,
-    cfg: LangConfig,
-) -> AudioSegment:
-    """Per-sentence clip for sentences without any new vocab:
-    original_slice + 600 + EN_TTS + 600 + NATIVE_TTS + 600 (trailing pause)."""
-    original_slice = original_audio[sentence.start_ms : sentence.end_ms]
-    en_clip = render_tts(
-        _wrap_ssml(_voice(cfg.en_voice, sentence_translation or "(no translation)", cfg.tts_rate), cfg.xml_lang),
-        tts_cache, az_key, az_region,
-    )
-    native_clip = render_tts(
-        _wrap_ssml(_voice(cfg.native_voice, sentence.text, cfg.tts_rate), cfg.xml_lang),
-        tts_cache, az_key, az_region,
-    )
-    gap = AudioSegment.silent(duration=NO_VOCAB_BREAK_MS)
-    return original_slice + gap + en_clip + gap + native_clip + gap + original_slice + gap
-
-
 # ─── Chunk assembly ───────────────────────────────────────────────────────────
 
 def assemble_chunk(
@@ -1007,9 +982,10 @@ def assemble_chunk(
     cfg: LangConfig,
 ) -> AudioSegment:
     """Build: original_chunk + 1s + 600ms + announcement + 600ms +
-    per-sentence playbacks (explanation clip for new-vocab sentences,
-    no-vocab clip otherwise) — pauses after every sentence — then a
-    "Playback part X of Y" announcement and a replay of the original chunk."""
+    per-sentence playbacks (explanation clip for new-vocab sentences only;
+    sentences without any vocab cue are skipped) — pauses after every
+    played sentence — then a "Playback part X of Y" announcement and a
+    replay of the original chunk."""
     original_slice = original_audio[chunk.start_ms : chunk.end_ms]
     out = original_slice
     out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
@@ -1025,16 +1001,6 @@ def assemble_chunk(
         if idx in explanations_by_sentence:
             out += explanations_by_sentence[idx]
             out += AudioSegment.silent(duration=INTER_PART_BREAK_MS)
-        else:
-            out += build_no_vocab_clip(
-                sentence=s,
-                sentence_translation=sentence_translations.get(s.text, ""),
-                original_audio=original_audio,
-                tts_cache=tts_cache,
-                az_key=az_key,
-                az_region=az_region,
-                cfg=cfg,
-            )
 
     # After the explanations, announce and replay the whole original chunk.
     replay_announcement = render_tts(
