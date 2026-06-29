@@ -883,12 +883,12 @@ def _wrap_ssml(body: str, xml_lang: str) -> str:
     )
 
 
-def ssml_sentence_pair(en_text: str, native_text: str, cfg: LangConfig) -> str:
-    body = (
-        _voice(cfg.en_voice, en_text or "(no translation)", cfg.tts_rate, trail_break_ms=INTRA_GROUP_BREAK_MS)
-        + _voice(cfg.native_voice, native_text, cfg.tts_rate)
+def ssml_en_sentence(en_text: str, cfg: LangConfig) -> str:
+    """English-only SSML for a sentence's translation, spoken in the EN voice."""
+    return _wrap_ssml(
+        _voice(cfg.en_voice, en_text or "(no translation)", cfg.tts_rate),
+        cfg.xml_lang,
     )
-    return _wrap_ssml(body, cfg.xml_lang)
 
 
 def ssml_long_explain(long_text: str, cfg: LangConfig) -> str:
@@ -949,7 +949,7 @@ def build_explanation_clip(
 ) -> AudioSegment:
     """Per-sentence clip for sentences containing ≥1 vocab cue:
     per-vocab SSML (the word in the foreign voice, then its explanation) +
-    original_slice + EN/native sentence pair + original_slice, with 500 ms
+    original_slice + EN sentence translation + original_slice, with 500 ms
     breaks. Each entry of vocab_ssml_in_order is a full Azure SSML document
     rendered directly; cues arrive as word/explanation pairs from
     :func:`build_vocab_ssml_by_sentence`."""
@@ -961,7 +961,7 @@ def build_explanation_clip(
         clip_a += render_tts(ssml, tts_cache, az_key, az_region)
     original_slice = original_audio[sentence.start_ms : sentence.end_ms]
     clip_b = render_tts(
-        ssml_sentence_pair(sentence_translation, sentence.text, cfg),
+        ssml_en_sentence(sentence_translation, cfg),
         tts_cache, az_key, az_region,
     )
     return clip_a + gap + original_slice + gap + clip_b + gap + original_slice
