@@ -605,10 +605,6 @@ VOCAB_SYSTEM = "Act as language learning API"
 
 def _vocab_prompt(
     count: int,
-    native_voice: str,
-    en_voice: str,
-    tts_rate: str,
-    break_ms: int,
     extra_field: str,
     extra_explain: str,
 ) -> str:
@@ -631,19 +627,10 @@ def _vocab_prompt(
         "non-Latin language, e.g. Mandarin, also include advanced, or obscured "
         "private names of places, e.g. countries, cities, private names. Output these "
         "words/phrases into a JSON array. Each JSON object has these properties: "
-        f'"text", "longExplainSsml", "longExplain", "shortExplain"{param1}. "text" '
-        'is the original text. "longExplainSsml" is the explanation of the text in '
-        "the context of the transcript, its format is Azure Speech-to-Text SSML. "
-        f"Rate will be {tts_rate}. Voice name is {en_voice} for English, "
-        f"{native_voice} for the foreign language. Switching between languages will "
-        f"have a break of {break_ms} ms; every <break> must be placed inside a "
-        "<voice> element (e.g. inside the preceding voice's <prosody>), never as a "
-        "direct child of <speak>. The SSML must be well-formed XML: every tag has "
-        "exactly one matching closing tag, tags are properly nested, and there are "
-        "no stray or duplicate closing tags (e.g. never emit </voice></voice>); "
-        "<voice> elements are never nested. End the document with a single "
-        '</speak>. "longExplain" is plain text version of '
-        '"longExplainSsml". Long explains must be 200 characters long maximum in plain text, keep them succinct. Prioritize English explanation for long explain. "shortExplain" is just short English translation. Do not repeat "text" at the beginning of "longExplainSsml" and "longExplain". Do not start with "this is" at the beginning of "longExplainSsml" and "longExplain", go straight to explaining'
+        f'"text", "longExplain", "shortExplain"{param1}. "text" '
+        'is the original text. "longExplain" is the explanation of the text in '
+        "the context of the transcript, its format is plain text. "
+        'Long explains must be 200-character long maximum, keep them succinct. Do not explain in target language then translate to English, just go straight to English explanation. "shortExplain" is just short English translation. Do not repeat "text" at the beginning of "longExplain". Do not start with "this is" at the beginning of "longExplain", go straight to explaining'
         f"{param4} No other response needed"
     )
 
