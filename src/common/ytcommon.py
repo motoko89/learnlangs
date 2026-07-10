@@ -40,8 +40,8 @@ SILENCE_LEN_MS = 500
 SILENCE_THRESH_DB = -16  # dB below the audio's average dBFS
 SILENCE_SEARCH_WINDOW_MS = 60 * 1000
 
-MIN_SENTENCE_MS = 3000
-MAX_SENTENCE_MS = 8000
+MIN_SENTENCE_MS = 5000
+MAX_SENTENCE_MS = 10000
 
 PUNCT_OR_DIGIT_RE = re.compile(r"^[\W\d_]+$", re.UNICODE)
 # Collapse whitespace that sits before punctuation when joining word tokens with
@@ -623,7 +623,7 @@ def _vocab_prompt(
         "Rank items by how much knowing them would improve understanding of this transcript and future native conversations, not by rarity."
         "Prioritize: - High-frequency conversational expressions.; - Fixed phrases and collocations.; - Discourse markers and connective expressions.; "
         "- Common spoken idioms.; - Frequently used verb-object combinations.; - Topic-specific terms only if they are essential to understanding this transcript.; "
-        "Do NOT prioritize obscure lexical units simply because it is difficult. "
+        "Do not prioritize obscure lexical units simply because it is difficult. "
         "Avoid selecting proper nouns, place names, organization names, people's names, or technical terms unless they are essential to understanding the conversation or are likely to appear in many future conversations. "
         "Prefer lexical units characteristic of natural spoken over formal written lexical units. "
         "When two candidates are equally useful, prefer the one that: - appears multiple times in the transcript,; - or represents a recurring concept,; - or is useful in many everyday conversations.; "
