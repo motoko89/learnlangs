@@ -27,6 +27,8 @@ from pathlib import Path
 
 from pydub import AudioSegment
 
+from .vocabstore import normalize_key
+
 # ─── Language-agnostic constants ──────────────────────────────────────────────
 
 TARGET_SAMPLE_RATE = 16000
@@ -70,6 +72,7 @@ class LangConfig:
     vocab_extra_field: str = ""     # extra OpenAI JSON property name, e.g. "pinyin" ("" if none)
     vocab_extra_explain: str = ""   # sentence describing the extra property ("" if none)
     album: str = ""                 # ID3 album tag for the final MP3, e.g. "LearnLangs French"
+    known_vocab_path: str = ""      # per-language known-vocab store ("" disables the filter)
 
 
 # ─── Bootstrap / config ───────────────────────────────────────────────────────
@@ -600,6 +603,20 @@ def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
 VOCAB_MODEL = "gpt-5.4"
 VOCAB_SYSTEM = "Act as language learning API"
 
+# Sent as a follow-up user turn when filtering against the known-vocab store
+# leaves a shortfall. The assistant's raw round-N reply is kept in the history
+# verbatim, so "anything you already proposed" is unambiguous.
+FOLLOWUP_TEMPLATE = (
+    "I already know these, or they repeat something you already gave me, so they "
+    "have been removed from your list:\n"
+    "{rejected}\n\n"
+    "Give me {need} more lexical unit(s) from the same transcript. Follow all the "
+    "original rules and the same ranking criteria. Do not repeat any item you have "
+    "already proposed, whether it was kept or removed. Return only a JSON array in "
+    "the same format containing only the new items. If the transcript contains no "
+    "further items worth learning, return an empty array."
+)
+
 
 def _vocab_prompt(
     count: int,
@@ -636,6 +653,28 @@ def _vocab_prompt(
     )
 
 
+def _parse_vocab_array(text: str) -> list[dict] | None:
+    """Pull the JSON array out of a model reply, or None if there isn't one.
+
+    Round 1 treats None as fatal; later rounds treat it as "no further items",
+    because a follow-up answering in prose ("nothing else worth learning here")
+    is legitimate and must not abort a 20-minute pipeline run."""
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _preview_texts(texts: list[str], limit: int = 10) -> str:
+    head = ", ".join(f"« {t} »" for t in texts[:limit])
+    extra = len(texts) - limit
+    return head + (f", … (+{extra})" if extra > 0 else "")
+
+
 def extract_vocab(
     transcript_text: str,
     api_key: str,
@@ -644,30 +683,106 @@ def extract_vocab(
     extra_field: str = "",
     extra_explain: str = "",
     model: str = VOCAB_MODEL,
+    *,
+    known_keys: set[str] | None = None,
+    max_rounds: int = 2,
 ) -> list[dict]:
-    """Ask Azure OpenAI (high reasoning effort) for the top-`vocab_number` vocab
-    items and return the parsed JSON array. Each item carries 'text',
-    'longExplain', 'shortExplain' (+ extra_field, e.g. 'pinyin'). 'longExplain'
-    and 'shortExplain' are plain English text; the playback SSML is synthesized
-    from them downstream (see :func:`build_vocab_ssml_by_sentence`)."""
+    """Ask Azure OpenAI (high reasoning effort) for `vocab_number` vocab items
+    the learner does not already know, and return the parsed JSON array. Each
+    item carries 'text', 'longExplain', 'shortExplain' (+ extra_field, e.g.
+    'pinyin'). 'longExplain' and 'shortExplain' are plain English text; the
+    playback SSML is synthesized from them downstream (see
+    :func:`build_vocab_ssml_by_sentence`).
+
+    `known_keys` holds :func:`common.vocabstore.normalize_key` keys for vocab
+    already in the learner's collection. Items matching one are dropped, and if
+    that leaves a shortfall the model is asked again *in the same chat* — told
+    which of its picks were rejected and how many replacements are wanted. The
+    transcript therefore travels only in the round-1 turn, though it is re-billed
+    as input on every round, and reasoning effort is high, so `max_rounds`
+    defaults to 2 (one follow-up) and is clamped to [1, 5]. `max_rounds=1`
+    reproduces the single-call behaviour while still filtering.
+
+    Round-2 items are the (N+1)…(N+k)-th best rather than the very best, since
+    the prompt ranks by usefulness — that is what asking for unknown-only items
+    means, not a defect. The result may be shorter than `vocab_number` when the
+    rounds are exhausted."""
     from openai import OpenAI
 
+    known = known_keys or set()
+    max_rounds = max(1, min(int(max_rounds), 5))
     prompt = _vocab_prompt(vocab_number, extra_field, extra_explain)
     client = OpenAI(base_url=base_url, api_key=api_key)
-    response = client.chat.completions.create(
-        model=model,
-        reasoning_effort="high",
-        messages=[
-            {"role": "system", "content": VOCAB_SYSTEM},
-            {"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript_text}"},
-        ],
-    )
+    messages: list[dict] = [
+        {"role": "system", "content": VOCAB_SYSTEM},
+        {"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript_text}"},
+    ]
 
-    text = (response.choices[0].message.content or "").strip()
-    start, end = text.find("["), text.rfind("]")
-    if start == -1 or end == -1 or end < start:
-        raise RuntimeError(f"Azure OpenAI vocab response had no JSON array:\n{text[:1000]}")
-    return json.loads(text[start : end + 1])
+    kept: list[dict] = []
+    kept_keys: set[str] = set()
+    for round_no in range(1, max_rounds + 1):
+        response = client.chat.completions.create(
+            model=model,
+            reasoning_effort="high",
+            messages=messages,
+        )
+        reply = (response.choices[0].message.content or "").strip()
+        items = _parse_vocab_array(reply)
+        if items is None:
+            if round_no == 1:
+                raise RuntimeError(
+                    f"Azure OpenAI vocab response had no JSON array:\n{reply[:1000]}"
+                )
+            print(f"  round {round_no}/{max_rounds}: reply held no JSON array; stopping")
+            break
+
+        rejected_known: list[str] = []
+        rejected_repeat: list[str] = []
+        fresh: list[dict] = []
+        for v in items:
+            text = (v.get("text") or "").strip() if isinstance(v, dict) else ""
+            if not text:
+                continue
+            key = normalize_key(text)
+            if key and key in known:
+                rejected_known.append(text)
+            elif key and key in kept_keys:
+                rejected_repeat.append(text)
+            else:
+                if key:
+                    kept_keys.add(key)
+                fresh.append(v)
+        kept.extend(fresh)
+
+        need = vocab_number - len(kept)
+        summary = (
+            f"  round {round_no}/{max_rounds}: {len(items)} proposed → "
+            f"{len(rejected_known)} known, {len(rejected_repeat)} repeat → {len(fresh)} new"
+        )
+        print(summary + (f" (need {need} more)" if need > 0 else ""))
+        rejected = rejected_known + rejected_repeat
+        if rejected:
+            # Printing these is the only way a normalization bug ever surfaces.
+            print(f"    dropped: {_preview_texts(rejected)}")
+
+        if need <= 0 or round_no == max_rounds:
+            break
+        if not fresh and not rejected_known:
+            # An empty array, or nothing but items it already proposed: the model
+            # has no more to give, so don't spend another high-effort call.
+            print("    nothing new and nothing newly-known; stopping")
+            break
+
+        messages.append({"role": "assistant", "content": reply})
+        messages.append({
+            "role": "user",
+            "content": FOLLOWUP_TEMPLATE.format(
+                rejected="\n".join(f"- {t}" for t in rejected),
+                need=need,
+            ),
+        })
+
+    return kept[:vocab_number]
 
 
 def build_vocab_ssml_by_sentence(
@@ -685,7 +800,11 @@ def build_vocab_ssml_by_sentence(
     Returns {sentence_idx: [ssml, ...]} for sentences with ≥1 cue (vocab order
     within a sentence; rendered in order with breaks by
     :func:`build_explanation_clip`). Items whose text never appears verbatim are
-    skipped (still kept in vocab.json/tsv)."""
+    skipped (still kept in vocab.json/tsv).
+
+    Note that as the known-vocab store grows, fewer items survive filtering in
+    :func:`extract_vocab`, so fewer sentences carry a cue and the output MP3 gets
+    shorter. That is the feature working, not a regression."""
     seen: set[str] = set()
     by_sentence: dict[int, list[str]] = {}
     for idx, s in enumerate(sentences):

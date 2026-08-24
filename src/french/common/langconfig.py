@@ -11,6 +11,11 @@ from pathlib import Path
 # from a sibling per-language script run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from common.ytcommon import LangConfig  # noqa: E402
+from common.vocabstore import default_store_path  # noqa: E402
+
+# Anchored to this file, not the cwd, so ytconverter and applepodcastconverter
+# share one known-vocab store per language.
+LANG_DIR = Path(__file__).resolve().parents[1]
 
 FRENCH = LangConfig(
     native_voice="fr-FR-Remy:DragonHDLatestNeural",
@@ -28,4 +33,5 @@ FRENCH = LangConfig(
     vocab_extra_field="",
     vocab_extra_explain="",
     album="LearnLangs French",
+    known_vocab_path=str(default_store_path(LANG_DIR)),
 )

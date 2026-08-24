@@ -12,6 +12,11 @@ from pathlib import Path
 # from a sibling per-language script run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from common.ytcommon import LangConfig, WordRec  # noqa: E402
+from common.vocabstore import default_store_path  # noqa: E402
+
+# Anchored to this file, not the cwd, so ytconverter and applepodcastconverter
+# share one known-vocab store per language.
+LANG_DIR = Path(__file__).resolve().parents[1]
 
 MANDARIN = LangConfig(
     native_voice="zh-TW-YunJheNeural",
@@ -29,6 +34,10 @@ MANDARIN = LangConfig(
     vocab_extra_field="pinyin",
     vocab_extra_explain='"pinyin" is the Hanyu Pinyin romanization (with tone marks) of "text".',
     album="LearnLangs Mandarin",
+    # Transcripts are converted to Traditional below, so the model emits
+    # Traditional and the store fills with Traditional. Seed from a Simplified
+    # Anki deck with: vocabstore.py import --lang mandarin <export> --opencc s2tw
+    known_vocab_path=str(default_store_path(LANG_DIR)),
 )
 
 

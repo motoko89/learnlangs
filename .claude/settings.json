@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(python3 -m py_compile src/common/vocabstore.py src/common/ytcommon.py src/common/ytpipeline.py src/*/common/langconfig.py src/*/ytconverter/ytconverter.py src/*/applepodcastconverter/*.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 src/common/vocabstore.py --help)",
+      "Bash(python3 src/common/vocabstore.py import --store /private/tmp/claude-501/-Users-hunghho-Documents-repos-learnlangs/97a171ec-5b67-4ff6-8f96-3fccb22c71a1/scratchpad/cli_store.tsv /private/tmp/claude-501/-Users-hunghho-Documents-repos-learnlangs/97a171ec-5b67-4ff6-8f96-3fccb22c71a1/scratchpad/anki_full.txt --dry-run)",
+      "Bash(python3 src/common/vocabstore.py import --store /private/tmp/claude-501/-Users-hunghho-Documents-repos-learnlangs/97a171ec-5b67-4ff6-8f96-3fccb22c71a1/scratchpad/cli_store.tsv /private/tmp/claude-501/-Users-hunghho-Documents-repos-learnlangs/97a171ec-5b67-4ff6-8f96-3fccb22c71a1/scratchpad/anki_full.txt)",
+      "Bash(python3 src/common/vocabstore.py check --store /private/tmp/claude-501/-Users-hunghho-Documents-repos-learnlangs/97a171ec-5b67-4ff6-8f96-3fccb22c71a1/scratchpad/cli_store.tsv /private/tmp/claude-501/-Users-hunghho-Documents-repos-learnlangs/97a171ec-5b67-4ff6-8f96-3fccb22c71a1/scratchpad/v.tsv)",
+      "Bash(python3 src/common/vocabstore.py check --lang french /private/tmp/claude-501/-Users-hunghho-Documents-repos-learnlangs/97a171ec-5b67-4ff6-8f96-3fccb22c71a1/scratchpad/v.tsv)",
+      "Bash(python3 src/common/vocabstore.py forget --store /private/tmp/claude-501/-Users-hunghho-Documents-repos-learnlangs/97a171ec-5b67-4ff6-8f96-3fccb22c71a1/scratchpad/cli_store.tsv nope)"
+    ]
+  }
+}

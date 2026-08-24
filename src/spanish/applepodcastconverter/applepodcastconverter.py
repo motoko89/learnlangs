@@ -10,10 +10,12 @@ End-to-end pipeline:
      ApplePodcasts extractor when the episode predates the lookup window.
   3. Transcribe with Google Chirp 3 (default; pass --stt mai for Azure
      MAI-Transcribe-1.5), with word-level timestamps. Cache JSON.
-  4. Extract the top-N vocab words/phrases (N = --vocab-number, default 40) with
+  4. Extract N *new* vocab words/phrases (N = --vocab-number, default 40) with
      the OpenAI API (each item carries a contextual SSML explanation, a
-     plain-text explanation and a short English gloss). Cache vocab.json, then
-     write vocab.tsv.
+     plain-text explanation and a short English gloss). Items already in the
+     known-vocab store are dropped and the model is asked again for the
+     shortfall (--vocab-rounds, default 2 = one follow-up). Cache vocab.json,
+     write vocab.tsv, then record the kept items back into the store.
   5. Translate every sentence (Cloud Translate v3) for the playback pairs.
   6. Slice the source audio into ~10-min chunks snapped to sentence ends.
   7. For each sentence containing ≥1 vocab item, render an Azure TTS explanation
@@ -33,6 +35,16 @@ I/O folders (created at invocation cwd):
   inputs/                 - downloaded MP3
   intermediates/<stem>/   - transcript.json, vocab.json, vocab.tsv, tts/, chunks/
   outputs/                - final concatenated study MP3
+
+
+Known-vocab store (so the same words aren't taught twice):
+  src/<lang>/known_vocab.tsv - shared by this script and its sibling converter.
+    Seed it from an Anki export, then every run appends what it extracted:
+      python3 src/common/vocabstore.py import --lang <lang> <export.txt> --dry-run
+      python3 src/common/vocabstore.py import --lang <lang> <export.txt>
+      python3 src/common/vocabstore.py check  --lang <lang> intermediates/<stem>/vocab.tsv
+      python3 src/common/vocabstore.py forget --lang <lang> <stem>
+    Bypass with --no-known-vocab (don't filter) or --no-record-vocab (don't append).
 
 Credentials (next to this script):
   key.json       - {"azSpeechKey": "<Azure Cognitive Services key>",

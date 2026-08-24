@@ -64,3 +64,7 @@ outputs/
 .DS_Store
 __pycache__/
 learntwords.txt
+# Per-language store of already-known vocab (src/<lang>/known_vocab.tsv).
+# Personal data; Anki stays the source of truth, so re-importing an export
+# rebuilds it. Drop this line if you'd rather keep its history in git.
+known_vocab.tsv

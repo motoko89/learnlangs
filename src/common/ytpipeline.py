@@ -53,6 +53,7 @@ from .ytcommon import (
     upload_to_gcs,
     write_transcript_files,
 )
+from .vocabstore import append_known, load_known
 
 
 def run_pipeline(
@@ -90,7 +91,18 @@ def run_pipeline(
     parser.add_argument("--min-speakers", type=int, default=2, help="Minimum speakers for diarization (chirp only; default: 2, min 1)")
     parser.add_argument("--max-speakers", type=int, default=None, help="Maximum speakers for diarization (chirp only; default: same as --min-speakers; clamped to >= min)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel chunk-build workers (default: 4)")
-    parser.add_argument("--vocab-number", type=int, default=40, help="Number of vocab words/phrases for OpenAI to extract (default: 40)")
+    parser.add_argument("--vocab-number", type=int, default=40,
+                        help="Target number of NEW vocab words/phrases per episode — items already in "
+                             "the known-vocab store don't count (default: 40; may come up short once "
+                             "--vocab-rounds is exhausted)")
+    parser.add_argument("--vocab-rounds", type=int, default=2,
+                        help="Max OpenAI rounds per episode: after filtering out known items, ask again "
+                             "for the shortfall (default: 2 = one follow-up; 1 disables follow-ups)")
+    parser.add_argument("--known-vocab", help="Path to the known-vocab store (else the language default)")
+    parser.add_argument("--no-known-vocab", action="store_true",
+                        help="Don't filter out already-known vocab this run (still records what it finds)")
+    parser.add_argument("--no-record-vocab", action="store_true",
+                        help="Don't add this episode's vocab to the known-vocab store")
     args = parser.parse_args()
 
     cwd = Path.cwd()
@@ -234,7 +246,23 @@ def run_pipeline(
     transcript_text = cfg.word_joiner.join(s.text for s in sentences)
 
     # ── 3. Vocab extraction (OpenAI, cached) ────────────────────────────────
+    # The invariant here: vocab.json is the POST-filter cache and vocab.tsv is the
+    # contract with Anki, so the known-vocab store records exactly what vocab.tsv
+    # contains. Hence filtering happens only on a fresh extraction (filtering the
+    # cache would drop every item the previous run just recorded, leaving the
+    # episode empty), while recording happens on both paths beside the TSV write.
     print("\n[3/6] vocab (OpenAI)")
+    store_path = Path(args.known_vocab) if args.known_vocab else (
+        Path(cfg.known_vocab_path) if cfg.known_vocab_path else None
+    )
+    known_keys: set[str] = set()
+    if store_path is None:
+        print("  known store: (none — filtering disabled)")
+    else:
+        known_keys = set(load_known(store_path))
+        state = "filter disabled (--no-known-vocab)" if args.no_known_vocab else f"{len(known_keys)} items"
+        print(f"  known store: {store_path} ({state})")
+
     vocab: list[dict] = []
     if vocab_json_path.exists() and vocab_json_path.stat().st_size > 0:
         try:
@@ -250,11 +278,20 @@ def run_pipeline(
             vocab_number=args.vocab_number,
             extra_field=cfg.vocab_extra_field,
             extra_explain=cfg.vocab_extra_explain,
+            known_keys=set() if args.no_known_vocab else known_keys,
+            max_rounds=args.vocab_rounds,
         )
         vocab_json_path.write_text(
             json.dumps(vocab, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(f"  → {len(vocab)} vocab items → {vocab_json_path.name}")
+        if not vocab and known_keys and not args.no_known_vocab:
+            print(
+                "Every candidate was already in the known-vocab store; nothing new to study.\n"
+                "Re-run with --no-known-vocab to force, or --vocab-rounds 3 to dig deeper.",
+                file=sys.stderr,
+            )
+            sys.exit(0)
     if not vocab:
         print("OpenAI returned no vocab items; nothing to synthesize. Exiting.")
         sys.exit(0)
@@ -269,6 +306,14 @@ def run_pipeline(
             row += [v.get("shortExplain", "")]
             writer.writerow(row)
     print(f"  → wrote {vocab_tsv_path.name}")
+
+    # Record on the cache path too, so a run that died in stage 5/6 still gets
+    # its items into the store on the retry. append_known dedupes by key, so
+    # re-recording an episode is a no-op. Undo one episode with:
+    #   python3 src/common/vocabstore.py forget --lang <lang> <stem>
+    if store_path is not None and not args.no_record_vocab:
+        added, total = append_known(store_path, vocab, source=stem)
+        print(f"  → recorded {added} new item(s) → {store_path.name} ({total} total)")
 
     # ── 4. Sentence translation (for playback pairs) ────────────────────────
     print("\n[4/6] translate sentences")
