@@ -56,7 +56,7 @@ Credentials (next to this script):
 Dependencies:
   pip install -r requirements.txt
   brew install ffmpeg   # pydub MP3 decode; also used by yt-dlp
-  python3 ytconverter.py  --min-speakers 3 --chunk-minutes 4 --max-speakers 6 --workers 4 --vocab-number 26
+  python3 ytconverter.py  --min-speakers 1 --chunk-minutes 4 --max-speakers 4 --workers 4 --vocab-number 30
   python3 /Users/hunghho/Documents/repos/learnlangs/src/common/vocabstore.py import --lang mandarin /Users/hunghho/Documents/Anki-TWMandarin.txt --dry-run
 """
 

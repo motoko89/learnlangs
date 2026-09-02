@@ -241,9 +241,18 @@ def transcribe(
     POLL_INTERVAL_S = 15
     POLL_TIMEOUT_S = 3600
 
-    def _on_retry(exc: Exception) -> None:
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  · [{now}] transient {type(exc).__name__} ({exc}); backing off...", file=sys.stderr)
+    def _on_retry(phase: str):
+        """Build an on_error callback tagged with the call it guards. The submit
+        (BatchRecognize) and poll (GetOperation) retries share a predicate and
+        an error type, so without the tag a backoff line cannot be attributed to
+        either — and the two bill different quotas."""
+        def _log(exc: Exception) -> None:
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"  · [{now}] {phase}: transient {type(exc).__name__} ({exc}); backing off...",
+                file=sys.stderr,
+            )
+        return _log
 
     retryable = garetry.if_exception_type(
         gexc.ResourceExhausted, gexc.ServiceUnavailable,
@@ -251,11 +260,11 @@ def transcribe(
     )
     submit_retry = garetry.Retry(
         predicate=retryable, initial=5.0, maximum=120.0, multiplier=2.0,
-        timeout=900.0, on_error=_on_retry,
+        timeout=900.0, on_error=_on_retry("BatchRecognize submit"),
     )
     poll_retry = garetry.Retry(
         predicate=retryable, initial=5.0, maximum=60.0, multiplier=2.0,
-        timeout=300.0, on_error=_on_retry,
+        timeout=300.0, on_error=_on_retry("GetOperation poll"),
     )
 
     def _await_batch(op_name: str):
