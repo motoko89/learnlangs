@@ -645,7 +645,7 @@ def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
 
 # ─── Azure OpenAI vocab extraction ────────────────────────────────────────────
 
-VOCAB_MODEL = "gpt-5.4"
+VOCAB_MODEL = "gpt-5.6-sol"
 VOCAB_SYSTEM = "Act as language learning API"
 
 # Sent as a follow-up user turn when filtering against the known-vocab store
