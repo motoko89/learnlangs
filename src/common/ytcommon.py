@@ -240,18 +240,29 @@ def transcribe(
     # transient 429s instead of crashing.
     POLL_INTERVAL_S = 15
     POLL_TIMEOUT_S = 3600
+    MIN_RETRY_GAP_S = 15
 
     def _on_retry(phase: str):
         """Build an on_error callback tagged with the call it guards. The submit
         (BatchRecognize) and poll (GetOperation) retries share a predicate and
         an error type, so without the tag a backoff line cannot be attributed to
-        either — and the two bill different quotas."""
+        either — and the two bill different quotas.
+
+        The callback also enforces the minimum gap between attempts. api_core
+        draws each backoff from ``random.uniform(0, cap)``, so an ``initial=5``
+        chain routinely retries 1-2s apart and digs the quota hole deeper; Retry
+        builds its own sleep generator, so there is no argument that can floor
+        that. api_core does call on_error *before* it draws and applies the
+        sleep, so blocking here sets a hard minimum — its jittered delay is then
+        added on top, and both count against the Retry timeout."""
         def _log(exc: Exception) -> None:
             now = time.strftime("%Y-%m-%d %H:%M:%S")
             print(
-                f"  · [{now}] {phase}: transient {type(exc).__name__} ({exc}); backing off...",
+                f"  · [{now}] {phase}: transient {type(exc).__name__} ({exc}); "
+                f"backing off ≥{MIN_RETRY_GAP_S}s...",
                 file=sys.stderr,
             )
+            time.sleep(MIN_RETRY_GAP_S)
         return _log
 
     retryable = garetry.if_exception_type(
@@ -272,6 +283,9 @@ def transcribe(
         its BatchRecognizeResponse. GetOperation calls here bill the v2 quota."""
         deadline = time.monotonic() + POLL_TIMEOUT_S
         while True:
+            # Sleep first: a batch that was submitted moments ago cannot be done
+            # yet, so an immediate GetOperation only spends operations quota.
+            time.sleep(POLL_INTERVAL_S)
             lro = client.get_operation(request={"name": op_name}, retry=poll_retry)
             if lro.done:
                 if lro.error.code:
@@ -283,7 +297,6 @@ def transcribe(
                 raise TimeoutError(
                     f"BatchRecognize operation did not finish within {POLL_TIMEOUT_S}s: {op_name}"
                 )
-            time.sleep(POLL_INTERVAL_S)
 
     words: list[WordRec] = []
     for i, (uri, offset) in enumerate(files, 1):
@@ -612,6 +625,11 @@ def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
 VOCAB_MODEL = "gpt-5.4"
 VOCAB_SYSTEM = "Act as language learning API"
 
+# Backoff for the vocab calls; see :func:`_vocab_completion`.
+VOCAB_RETRY_ATTEMPTS = 6
+VOCAB_RETRY_BASE_S = 30
+VOCAB_RETRY_CAP_S = 300
+
 # Sent as a follow-up user turn when filtering against the known-vocab store
 # leaves a shortfall. The assistant's raw round-N reply is kept in the history
 # verbatim, so "anything you already proposed" is unambiguous.
@@ -684,6 +702,57 @@ def _preview_texts(texts: list[str], limit: int = 10) -> str:
     return head + (f", … (+{extra})" if extra > 0 else "")
 
 
+def _retry_after_s(exc: Exception) -> float | None:
+    """Seconds the service asked us to wait, if it sent a Retry-After header."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    raw = headers.get("retry-after") if headers is not None else None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _vocab_completion(client, model: str, messages: list[dict]):
+    """One high-effort chat completion, retrying transient failures slowly.
+
+    A 429 from the Azure deployment is a per-minute quota, not a dead end, but
+    each vocab call sends the whole transcript at high reasoning effort, so the
+    SDK's built-in retries (seconds apart, and it re-bills the prompt every
+    time) only dig the quota hole deeper — the client is built with
+    max_retries=0 and this is the only retry chain. Retry-After wins when the
+    service sends one."""
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
+
+    transient = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
+    for attempt in range(1, VOCAB_RETRY_ATTEMPTS + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                reasoning_effort="high",
+                messages=messages,
+            )
+        except transient as e:
+            if attempt == VOCAB_RETRY_ATTEMPTS:
+                raise
+            delay = min(
+                _retry_after_s(e) or VOCAB_RETRY_BASE_S * 2 ** (attempt - 1),
+                VOCAB_RETRY_CAP_S,
+            )
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"  · [{now}] vocab: transient {type(e).__name__} ({e}); "
+                f"attempt {attempt}/{VOCAB_RETRY_ATTEMPTS}, retrying in {delay:.0f}s...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+
 def extract_vocab(
     transcript_text: str,
     api_key: str,
@@ -721,7 +790,7 @@ def extract_vocab(
     known = known_keys or set()
     max_rounds = max(1, min(int(max_rounds), 5))
     prompt = _vocab_prompt(vocab_number, extra_field, extra_explain)
-    client = OpenAI(base_url=base_url, api_key=api_key)
+    client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
     messages: list[dict] = [
         {"role": "system", "content": VOCAB_SYSTEM},
         {"role": "user", "content": f"{prompt}\n\nTranscript:\n{transcript_text}"},
@@ -730,11 +799,19 @@ def extract_vocab(
     kept: list[dict] = []
     kept_keys: set[str] = set()
     for round_no in range(1, max_rounds + 1):
-        response = client.chat.completions.create(
-            model=model,
-            reasoning_effort="high",
-            messages=messages,
-        )
+        try:
+            response = _vocab_completion(client, model, messages)
+        except Exception as e:
+            # Round 1 has nothing to salvage; a later round does — returning the
+            # items already kept beats losing a whole run to a quota blip.
+            if round_no == 1:
+                raise
+            print(
+                f"  round {round_no}/{max_rounds}: call failed ({type(e).__name__}: {e}); "
+                f"keeping the {len(kept)} item(s) from earlier round(s)",
+                file=sys.stderr,
+            )
+            break
         reply = (response.choices[0].message.content or "").strip()
         items = _parse_vocab_array(reply)
         if items is None:
