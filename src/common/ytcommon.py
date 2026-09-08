@@ -51,6 +51,54 @@ PUNCT_OR_DIGIT_RE = re.compile(r"^[\W\d_]+$", re.UNICODE)
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.;:!?…»)\]])")
 
 
+# ─── The one retry policy ─────────────────────────────────────────────────────
+
+RETRY_BASE_S = 15
+RETRY_MAX_RETRIES = 5
+
+
+class TransientError(RuntimeError):
+    """A failure worth retrying, raised by a callable that has to judge that
+    itself because its SDK reports the failure in a result object rather than
+    by raising (Azure TTS cancels a too-slow request that way)."""
+
+
+def with_retries(
+    what: str,
+    fn,
+    *,
+    retry_on: tuple[type[BaseException], ...] = (TransientError,),
+    max_retries: int = RETRY_MAX_RETRIES,
+    base_s: float = RETRY_BASE_S,
+):
+    """Call ``fn()``, retrying failures in ``retry_on`` with a doubling backoff.
+
+    Every quota this pipeline touches (Chirp v2 operations, the Azure OpenAI
+    deployment, Azure TTS) is per-minute, so a retry seconds after the failure
+    only digs the hole deeper — the first retry therefore waits ``base_s`` (15s)
+    and each following one waits twice as long: 15s, 30s, 60s, 120s, 240s. The
+    vendor SDKs' own fast, jittered retries are disabled at every call site so
+    this is the only retry chain in the pipeline.
+
+    ``max_retries`` extra attempts follow the first one; the final failure is
+    re-raised. ``what`` tags the log line, so a backoff can always be attributed
+    to the call that produced it."""
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except retry_on as e:
+            if attempt == max_retries:
+                raise
+            delay = base_s * 2 ** attempt
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"  · [{now}] {what}: transient {type(e).__name__} ({e}); "
+                f"retry {attempt + 1}/{max_retries} in {delay:.0f}s...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+
 # ─── Per-language configuration ───────────────────────────────────────────────
 
 @dataclass
@@ -209,7 +257,6 @@ def transcribe(
     Returns a flat list of word records, timestamps already offset and sorted."""
     from google.api_core.client_options import ClientOptions
     from google.api_core import exceptions as gexc
-    from google.api_core import retry as garetry
     from google.cloud.speech_v2 import SpeechClient
     from google.cloud.speech_v2.types import cloud_speech
 
@@ -236,46 +283,14 @@ def transcribe(
     # initial backoff) — that is what 429s and aborts a run. Poll manually
     # through the v2 client's own get_operation (it carries the routing header
     # x-goog-request-params: name=projects/.../locations/<region>/operations/...,
-    # so it is billed to the v2 quota) at a fixed, gentle interval, and retry the
-    # transient 429s instead of crashing.
+    # so it is billed to the v2 quota) at a fixed, gentle interval, and let
+    # :func:`with_retries` — not api_core's jittered chain, hence retry=None on
+    # every call — handle the transient 429s instead of crashing.
     POLL_INTERVAL_S = 15
     POLL_TIMEOUT_S = 3600
-    MIN_RETRY_GAP_S = 15
-
-    def _on_retry(phase: str):
-        """Build an on_error callback tagged with the call it guards. The submit
-        (BatchRecognize) and poll (GetOperation) retries share a predicate and
-        an error type, so without the tag a backoff line cannot be attributed to
-        either — and the two bill different quotas.
-
-        The callback also enforces the minimum gap between attempts. api_core
-        draws each backoff from ``random.uniform(0, cap)``, so an ``initial=5``
-        chain routinely retries 1-2s apart and digs the quota hole deeper; Retry
-        builds its own sleep generator, so there is no argument that can floor
-        that. api_core does call on_error *before* it draws and applies the
-        sleep, so blocking here sets a hard minimum — its jittered delay is then
-        added on top, and both count against the Retry timeout."""
-        def _log(exc: Exception) -> None:
-            now = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(
-                f"  · [{now}] {phase}: transient {type(exc).__name__} ({exc}); "
-                f"backing off ≥{MIN_RETRY_GAP_S}s...",
-                file=sys.stderr,
-            )
-            time.sleep(MIN_RETRY_GAP_S)
-        return _log
-
-    retryable = garetry.if_exception_type(
+    transient = (
         gexc.ResourceExhausted, gexc.ServiceUnavailable,
         gexc.DeadlineExceeded, gexc.Aborted,
-    )
-    submit_retry = garetry.Retry(
-        predicate=retryable, initial=5.0, maximum=120.0, multiplier=2.0,
-        timeout=900.0, on_error=_on_retry("BatchRecognize submit"),
-    )
-    poll_retry = garetry.Retry(
-        predicate=retryable, initial=5.0, maximum=60.0, multiplier=2.0,
-        timeout=300.0, on_error=_on_retry("GetOperation poll"),
     )
 
     def _await_batch(op_name: str):
@@ -286,7 +301,11 @@ def transcribe(
             # Sleep first: a batch that was submitted moments ago cannot be done
             # yet, so an immediate GetOperation only spends operations quota.
             time.sleep(POLL_INTERVAL_S)
-            lro = client.get_operation(request={"name": op_name}, retry=poll_retry)
+            lro = with_retries(
+                "GetOperation poll",
+                lambda: client.get_operation(request={"name": op_name}, retry=None),
+                retry_on=transient,
+            )
             if lro.done:
                 if lro.error.code:
                     raise RuntimeError(
@@ -309,7 +328,11 @@ def transcribe(
             ),
         )
         print(f"  → [{i}/{len(files)}] STT v2 ({model}) BatchRecognize submitted (+{offset}ms); waiting...")
-        operation = client.batch_recognize(request=request, retry=submit_retry)
+        operation = with_retries(
+            f"BatchRecognize submit [{i}/{len(files)}]",
+            lambda: client.batch_recognize(request=request, retry=None),
+            retry_on=transient,
+        )
         response = _await_batch(operation.operation.name)
 
         for resp_uri, file_result in response.results.items():
@@ -625,11 +648,6 @@ def sentences_from_jsonable(rows: list[dict]) -> list[Sentence]:
 VOCAB_MODEL = "gpt-5.4"
 VOCAB_SYSTEM = "Act as language learning API"
 
-# Backoff for the vocab calls; see :func:`_vocab_completion`.
-VOCAB_RETRY_ATTEMPTS = 6
-VOCAB_RETRY_BASE_S = 30
-VOCAB_RETRY_CAP_S = 300
-
 # Sent as a follow-up user turn when filtering against the known-vocab store
 # leaves a shortfall. The assistant's raw round-N reply is kept in the history
 # verbatim, so "anything you already proposed" is unambiguous.
@@ -702,26 +720,14 @@ def _preview_texts(texts: list[str], limit: int = 10) -> str:
     return head + (f", … (+{extra})" if extra > 0 else "")
 
 
-def _retry_after_s(exc: Exception) -> float | None:
-    """Seconds the service asked us to wait, if it sent a Retry-After header."""
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None)
-    raw = headers.get("retry-after") if headers is not None else None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
-
-
 def _vocab_completion(client, model: str, messages: list[dict]):
-    """One high-effort chat completion, retrying transient failures slowly.
+    """One high-effort chat completion, retried by :func:`with_retries`.
 
     A 429 from the Azure deployment is a per-minute quota, not a dead end, but
-    each vocab call sends the whole transcript at high reasoning effort, so the
-    SDK's built-in retries (seconds apart, and it re-bills the prompt every
-    time) only dig the quota hole deeper — the client is built with
-    max_retries=0 and this is the only retry chain. Retry-After wins when the
-    service sends one."""
+    each call re-sends the whole transcript at high reasoning effort, so the
+    SDK's own retries (seconds apart, re-billing the prompt every time) only dig
+    the quota hole deeper — the client is built with max_retries=0 so the shared
+    backoff is the only one."""
     from openai import (
         APIConnectionError,
         APITimeoutError,
@@ -729,28 +735,15 @@ def _vocab_completion(client, model: str, messages: list[dict]):
         RateLimitError,
     )
 
-    transient = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
-    for attempt in range(1, VOCAB_RETRY_ATTEMPTS + 1):
-        try:
-            return client.chat.completions.create(
-                model=model,
-                reasoning_effort="high",
-                messages=messages,
-            )
-        except transient as e:
-            if attempt == VOCAB_RETRY_ATTEMPTS:
-                raise
-            delay = min(
-                _retry_after_s(e) or VOCAB_RETRY_BASE_S * 2 ** (attempt - 1),
-                VOCAB_RETRY_CAP_S,
-            )
-            now = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(
-                f"  · [{now}] vocab: transient {type(e).__name__} ({e}); "
-                f"attempt {attempt}/{VOCAB_RETRY_ATTEMPTS}, retrying in {delay:.0f}s...",
-                file=sys.stderr,
-            )
-            time.sleep(delay)
+    return with_retries(
+        "vocab completion",
+        lambda: client.chat.completions.create(
+            model=model,
+            reasoning_effort="high",
+            messages=messages,
+        ),
+        retry_on=(RateLimitError, APIConnectionError, APITimeoutError, InternalServerError),
+    )
 
 
 def extract_vocab(
@@ -1044,22 +1037,23 @@ def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> Audio
                 speechsdk.CancellationErrorCode.ServiceError,
                 speechsdk.CancellationErrorCode.RuntimeError,
             }
-            max_attempts = 4
-            for attempt in range(1, max_attempts + 1):
+
+            def _synthesize():
                 audio_config = speechsdk.audio.AudioOutputConfig(filename=str(tmp_path))
                 synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
                 result = synthesizer.speak_ssml_async(ssml).get()
                 if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    break
+                    return result
                 details = getattr(result, "cancellation_details", None)
                 err = details.error_details if details else "unknown"
                 code = details.error_code if details else None
-                if code in transient_codes and attempt < max_attempts:
-                    time.sleep(2 ** (attempt - 1))
-                    continue
+                if code in transient_codes:
+                    raise TransientError(f"Azure TTS cancelled: {code} / {err}")
                 raise RuntimeError(
                     f"Azure TTS failed: {result.reason} / {err}\nSSML was:\n{ssml}"
                 )
+
+            with_retries(f"Azure TTS {sha[:8]}", _synthesize, max_retries=3)
             os.replace(tmp_path, out_path)
         finally:
             try:
