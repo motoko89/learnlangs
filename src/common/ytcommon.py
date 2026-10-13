@@ -1026,6 +1026,15 @@ def render_tts(ssml: str, cache_dir: Path, az_key: str, az_region: str) -> Audio
             speech_config.set_speech_synthesis_output_format(
                 speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3
             )
+            # The SDK's client-side watchdog cancels a synthesis (ServiceTimeout,
+            # "Timeout while synthesizing") once the gap between audio frames
+            # exceeds 3000ms AND the real-time factor exceeds 2. DragonHD voices
+            # stream in bursts with multi-second gaps, so short clips (e.g. the
+            # "Part N of M" announcement: one 2880-byte break frame, then >3s of
+            # silence) trip it on every attempt. Loosen both thresholds so only
+            # a genuinely stalled stream is cancelled.
+            speech_config.set_property(speechsdk.PropertyId.SpeechSynthesis_FrameTimeoutInterval, "30000")
+            speech_config.set_property(speechsdk.PropertyId.SpeechSynthesis_RtfTimeoutThreshold, "20")
             # The service decides a request that is too slow (RTF/frame-interval
             # threshold) and cancels it — transient and retryable. Bad SSML, by
             # contrast, is cancelled with a definite error code and never recovers.
